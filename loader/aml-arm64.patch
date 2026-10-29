@@ -1,0 +1,16 @@
+diff --git a/Android.mk b/Android.mk
+index 49052cd..95764df 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -28,8 +28,9 @@ LOCAL_SRC_FILES         := main.cpp src/interface.cpp src/aml.cpp src/modpaks.cp
+                            mod/logger.cpp mod/config.cpp
+ 
+  ## FLAGS ##
+-LOCAL_CFLAGS += -O2 -mfloat-abi=softfp -DNDEBUG -D__AML -DNO_HOOKDEFINES -DFASTMAN92_CODE -std=c17 -mthumb
+-LOCAL_CXXFLAGS += -O2 -mfloat-abi=softfp -DNDEBUG -D__AML -DNO_HOOKDEFINES -DFASTMAN92_CODE -std=c++17 -mthumb -fexceptions
++ARM32_FLAGS := $(if $(filter arm64-v8a,$(TARGET_ARCH_ABI)),,-mfloat-abi=softfp -mthumb)
++LOCAL_CFLAGS += -O2 $(ARM32_FLAGS) -DNDEBUG -D__AML -DNO_HOOKDEFINES -DFASTMAN92_CODE -std=c17
++LOCAL_CXXFLAGS += -O2 $(ARM32_FLAGS) -DNDEBUG -D__AML -DNO_HOOKDEFINES -DFASTMAN92_CODE -std=c++17 -fexceptions
+ LOCAL_C_INCLUDES += $(LOCAL_PATH)/include $(LOCAL_PATH)/AML_PrecompiledLibs/include
+ LOCAL_LDLIBS += -llog -ldl -landroid
+ 

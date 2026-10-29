@@ -1,0 +1,3 @@
+[submodule "loader/aml"]
+	path = loader/aml
+	url = https://github.com/RusJJ/AndroidModLoader

@@ -1,0 +1,9 @@
+*.apk
+*.so
+*.keystore
+*.jks
+*.log
+nm_*.txt
+obj/
+libs/
+out/
