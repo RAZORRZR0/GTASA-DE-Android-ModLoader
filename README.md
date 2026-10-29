@@ -29,12 +29,13 @@ keystore is git-ignored and is never committed.
 
 ## Install
 
-1. Install the patched APK. The original must be uninstalled first, which
-   wipes its save data.
+1. Back up your saves, uninstall the original (this wipes its data), then
+   install the patched APK (`loader/patch_apk_aml.sh`).
 2. Copy `mods/propfix/libs/arm64-v8a/libpropfix.so` (built by `mods/build.sh`)
    to `Android/data/com.rockstargames.gtasa.de/mods/`.
-3. Copy `mods/propfix/GTA_Prop_Fix.ini` to the AML config path
-   (`GetConfigPath()`). That exact device path is not verified in this repo.
+3. Copy `mods/propfix/GTA_Prop_Fix.ini` to
+   `Android/data/com.rockstargames.gtasa.de/configs/` (verified on device:
+   logcat `GTAPropFix: ini .../configs/GTA_Prop_Fix.ini (found)`).
    The defaults are in `docs/settings-defaults.md`.
 
 ## Credits and licenses

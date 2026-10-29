@@ -32,9 +32,11 @@ for every key.
 - The only key where the shipped ini and the code default differ is
   `StreetLightsFallWhole`: code default 1, shipped ini 0. The PC README says 1.
   Ship the ini: if it is missing, the code default (1) applies.
-- The "Android ini before" column is reconstructed from the reported finding
-  (the Android ini was identical to the PC ini except `StreetLightsFallWhole=1`).
-  The original device file is not in this repo, so this column is not a
-  byte-level capture.
+- "Android ini before" was measured: a sorted key=value diff of the first
+  Android ini (as deployed to the device) against the PC ini showed exactly one
+  difference, `StreetLightsFallWhole=1` vs `0`. It came from writing the ini from
+  README defaults instead of copying the shipped file. Observed effect in game:
+  lamp posts fell over whole (`street light hit (no shatter) ... RenderWare
+  decides`) instead of shattering as they do on PC.
 - "Android ini now" is the repo `mods/propfix/GTA_Prop_Fix.ini`, byte-identical
   to the PC ini. If your PC ini differs, compare it against this table.
