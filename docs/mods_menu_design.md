@@ -8,9 +8,12 @@
 - The **mod page**, all on one scrolling page:
   - `< back`;
   - an `enabled` row;
-  - every key of the mod's ini, in file order:
-    - Bool keys and Choice keys (`; N = text` comments) are editable; they are saved immediately and atomically, and comments are preserved;
-    - numbers and strings are shown read-only, because there is no range source for sliders yet.
+  - every key of the mod's ini, in file order. Each change is saved immediately and atomically, and comments are preserved:
+    - Bool keys toggle;
+    - Choice keys (`; N = text` comments) cycle their labels;
+    - Int keys step by 1 and Float keys by 0.1, keeping their decimals; values that start non-negative stop at 0;
+    - string keys are shown read-only, because there is no text input.
+- **Live changes:** after saving, ModMenu calls `extern "C" void GTAML_OnConfigChanged()` if the loaded mod exports it, and the page header says "changes apply live". Otherwise it says "changes apply after restart". PropFix implements it by re-reading its ini; only `Log` still needs a restart.
 - **Which ini belongs to a mod:** `configs/modmenu.ini` `[Links] mod=File.ini`, or a normalized-name match.
 
 ## How it works
@@ -29,5 +32,11 @@
 - **Write detector:** while the screen exists, hooks on `UGameterSettings::Set{Bool,Int,Float}Value` log any write. None were seen in testing.
 
 ## Limits
-- Numeric and string ini keys are read-only. A slider needs min/max, which the ini doesn't provide.
+- String keys are read-only.
 - Gamepad navigation is untested.
+
+## For mod authors: live settings
+Export one function. ModMenu calls it on the game thread, right after your ini was saved:
+```cpp
+extern "C" __attribute__((visibility("default"))) void GTAML_OnConfigChanged() { LoadConfig(); }
+```

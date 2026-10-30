@@ -332,4 +332,24 @@ std::vector<std::string> UnlinkedInis(const std::vector<std::string>& iniFiles,
     return out;
 }
 
+std::string StepNumber(const std::string& value, ValueKind kind, int dir) {
+    char* end = nullptr;
+    const double v = strtod(value.c_str(), &end);
+    if (end == value.c_str()) return value;
+    if (kind == ValueKind::Int) {
+        long n = (long)v + dir;
+        if (v >= 0 && n < 0) n = 0;
+        return std::to_string(n);
+    }
+    if (kind != ValueKind::Float) return value;
+    const size_t dot = value.find('.');
+    int decimals = dot == std::string::npos ? 1 : (int)(value.size() - dot - 1);
+    if (decimals < 1) decimals = 1;
+    double n = v + 0.1 * dir;
+    if (v >= 0 && n < 0) n = 0;
+    char buf[64];
+    snprintf(buf, sizeof buf, "%.*f", decimals, n);
+    return buf;
+}
+
 }  // namespace modmenu

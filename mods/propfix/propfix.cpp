@@ -90,7 +90,9 @@ static void JoinDir(char* out, size_t cap, const char* dir, const char* file) {
 
 static void LoadConfig() {
     JoinDir(g_iniPath, sizeof(g_iniPath), aml->GetConfigPath(), "GTA_Prop_Fix.ini");
-    g_iniFound = fopen(g_iniPath, "r") != nullptr;
+    FILE* probe = fopen(g_iniPath, "r");
+    g_iniFound = probe != nullptr;
+    if (probe) fclose(probe);
     const char* ini = g_iniPath;
     g_cfg.rwDislodgedProps    = GetPrivateProfileIntA("Props", "RenderWarePhysicsForDislodgedProps", 1, ini) != 0;
     g_cfg.lightsOffWhenTilted = GetPrivateProfileIntA("Props", "StreetLightsOffWhenTilted", 1, ini) != 0;
@@ -129,6 +131,16 @@ static void LoadConfig() {
     g_cfg.logLevel            = GetPrivateProfileIntA("Debug", "Log", 1, ini);
     if (g_cfg.debrisMode < DEBRIS_ORIGINAL || g_cfg.debrisMode > DEBRIS_STOCK) g_cfg.debrisMode = DEBRIS_ORIGINAL;
     if (g_cfg.debrisPlaneSizeM < 1.0f) g_cfg.debrisPlaneSizeM = 30.0f;
+}
+
+// ModMenu calls this after it saved our ini, so settings change live. Log level/file stay as opened at start.
+static void Log(int level, const char* fmt, ...);
+extern "C" __attribute__((visibility("default"))) void GTAML_OnConfigChanged() {
+    const int logLevel = g_cfg.logLevel;
+    LoadConfig();
+    g_cfg.logLevel = logLevel;
+    Log(1, "config reloaded: fallWhole=%d pieces=%.2fs fade=%.2fs lifetime=%d", g_cfg.uprootStreetLights,
+        g_cfg.piecesDisappearSeconds, g_cfg.piecesFadeSeconds, g_cfg.debrisMode);
 }
 
 // ---- Logging: one file per session in the AML data path.

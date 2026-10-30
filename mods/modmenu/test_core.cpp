@@ -208,6 +208,14 @@ int main(int argc, char** argv) {
     TestIni(src);
     TestMods();
     TestLinks(src);
+    // Number stepping.
+    CHECK(StepNumber("60", ValueKind::Int, 1) == "61");
+    CHECK(StepNumber("0", ValueKind::Int, -1) == "0");
+    CHECK(StepNumber("-3", ValueKind::Int, -1) == "-4");
+    CHECK(StepNumber("2.55", ValueKind::Float, 1) == "2.65");
+    CHECK(StepNumber("1.5", ValueKind::Float, -1) == "1.4");
+    CHECK(StepNumber("0.05", ValueKind::Float, -1) == "0.00");
+    CHECK(StepNumber("abc", ValueKind::Float, 1) == "abc");
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

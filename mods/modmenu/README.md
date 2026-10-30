@@ -3,8 +3,8 @@
 Adds a **mods** entry to the pause menu (and main menu), placed before *exit*. The goal is a native-looking screen where each mod can be turned on/off and its ini edited.
 
 ## Status
-Working on device (main + pause menu): mod list with on/off, per-mod settings page (Bool/Choice keys editable,
-numbers read-only). Design and internals: `docs/mods_menu_design.md`; Blueprint RE: `docs/bp_decompiled.md`.
+Working on device (main + pause menu): mod list with on/off, per-mod settings page (Bool/Choice/number keys editable,
+live when the mod exports `GTAML_OnConfigChanged`). Design and internals: `docs/mods_menu_design.md`; Blueprint RE: `docs/bp_decompiled.md`.
 
 ## Build / test
 ```

@@ -76,6 +76,10 @@ private:
 
 // ---- Links -------------------------------------------------------------------
 // Match key: lowercase, [a-z0-9] only, leading "lib" dropped. "libpropfix" and "PropFix" both give "propfix".
+// One arrow step of a number key: Int by 1, Float by 0.1 keeping its decimals (at least one).
+// Values that start non-negative never go below 0 (counts, seconds, percents). Unchanged text on bad input.
+std::string StepNumber(const std::string& value, ValueKind kind, int dir);
+
 std::string NormalizeName(const std::string& name);
 // [Links] section of configs/modmenu.ini: normalized mod name -> ini file name.
 std::map<std::string, std::string> ParseLinks(const IniDoc& doc);

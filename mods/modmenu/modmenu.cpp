@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <dlfcn.h>
 #include <algorithm>
 #include <map>
 #include <string>
@@ -327,8 +328,20 @@ static std::string KeyValueText(const modmenu::IniKey& k) {
 
 static std::string ModState(size_t i) { return g_mods.At(i).enabled ? "ON" : "OFF"; }
 
-// Steps an ini key (Bool toggles, Choice cycles its labels) and saves the file.
-static void StepKey(const std::string& id, int dir) {
+// Live settings: a loaded mod may export `extern "C" void GTAML_OnConfigChanged()`; we call it after saving its ini.
+typedef void (*ConfigChanged_Fn)();
+static ConfigChanged_Fn LiveHook(size_t mod) {
+    if (!g_mods.At(mod).enabled) return nullptr;
+    const std::string so = "lib" + g_mods.At(mod).name + ".so";
+    void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_NOLOAD);  // only if AML already loaded it
+    if (!h) return nullptr;
+    ConfigChanged_Fn fn = (ConfigChanged_Fn)dlsym(h, "GTAML_OnConfigChanged");
+    dlclose(h);  // drops the reference NOLOAD added; the library stays loaded
+    return fn;
+}
+
+// Steps an ini key (Bool toggles, Choice cycles its labels, numbers step), saves the file, notifies the mod.
+static void StepKey(const std::string& id, int dir, size_t mod) {
     if (g_docs.empty()) return;
     modmenu::IniDoc& doc = g_docs[0];
     const modmenu::IniKey* k = doc.Find(id);
@@ -343,10 +356,13 @@ static void StepKey(const std::string& id, int dir) {
         for (int j = 0; j < n; ++j) if (std::to_string(L[j].value) == k->value) i = j;
         if (i < 0) i = dir > 0 ? -1 : n;
         next = std::to_string(L[((i + dir) % n + n) % n].value);
+    } else if (k->kind == modmenu::ValueKind::Int || k->kind == modmenu::ValueKind::Float) {
+        next = modmenu::StepNumber(k->value, k->kind, dir);
     } else {
-        return;  // shortcut: numbers/strings are read-only here; add slider rows when a range source exists
+        return;  // shortcut: strings are read-only (no text input); use the slider row's text box if a mod needs it
     }
-    if (!doc.Set(id, next) || !doc.Save()) LOG("could not save %s", id.c_str());
+    if (!doc.Set(id, next) || !doc.Save()) { LOG("could not save %s", id.c_str()); return; }
+    if (ConfigChanged_Fn fn = LiveHook(mod)) fn();
 }
 
 // ---- Building rows -------------------------------------------------------------------
@@ -436,7 +452,8 @@ static void Build() {
             AddRow(sel, RowKind::Selection, Act::OpenMod, i, "", g_mods.At(i).name, ModState(i) + "  >");
     } else {
         const size_t m = (size_t)g_view;
-        AddRow(msg, RowKind::Message, Act::Back, 0, "", "<  back", g_mods.At(m).name);
+        AddRow(msg, RowKind::Message, Act::Back, 0, "", "<  back",
+               g_mods.At(m).name + (LiveHook(m) ? "  -  changes apply live" : "  -  changes apply after restart"));
         AddRow(sel, RowKind::Selection, Act::ToggleMod, m, "", "enabled", ModState(m));
         g_docs.clear();
         modmenu::IniDoc cfg;
@@ -450,7 +467,8 @@ static void Build() {
         if (g_docs.empty()) AddRow(msg, RowKind::Message, Act::None, 0, "", "no settings file", "");
         else
             for (const modmenu::IniKey& k : g_docs[0].Keys()) {
-                const bool editable = k.kind == modmenu::ValueKind::Bool ||
+                const bool editable = k.kind == modmenu::ValueKind::Bool || k.kind == modmenu::ValueKind::Int ||
+                                      k.kind == modmenu::ValueKind::Float ||
                                       (k.kind == modmenu::ValueKind::Choice && !k.labels.empty());
                 if (editable) AddRow(sel, RowKind::Selection, Act::IniKey, m, k.id, k.id, KeyValueText(k));
                 else AddRow(msg, RowKind::Message, Act::None, m, k.id, k.id, k.value);
@@ -494,7 +512,7 @@ static void Activate(Row& r, int dir) {  // dir: +1 next / -1 previous / 0 body 
         LOG("mod %s -> %s", g_mods.At(r.mod).name.c_str(), ModState(r.mod).c_str());
         break;
     case Act::IniKey:
-        StepKey(r.key, dir ? dir : 1);
+        StepKey(r.key, dir ? dir : 1, r.mod);
         if (const modmenu::IniKey* k = g_docs.empty() ? nullptr : g_docs[0].Find(r.key)) r.value = KeyValueText(*k);
         LOG("%s -> %s", r.key.c_str(), r.value.c_str());
         break;
