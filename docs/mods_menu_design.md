@@ -1,35 +1,33 @@
-# Mods menu: design and findings
+# Mods menu: design (verified on device, v1.87.0)
 
-## Entry injection (verified on device, v1.87.0)
-- `ProcessEvent` "SetTemplate" on `UI_MainMenu_C` / `UI_PauseMenu_C` passes the template asset in the first 8 bytes of parms. The assets are `GTASA_MainMenu_Mobile` and `GTASA_PauseMenu_Mobile`.
-- modmenu inserts the following before *exit* in the parallel arrays (`LeftButtons`, `FunctionToCallOnPress`, `SelectorTabs`). Each template is patched once.
+## What the user sees
+- A **mods** entry in the main menu and the pause menu, placed before *exit*.
+- The **mod list**: header "mods (N)", a row "N mods installed · changes apply after restart", and one row per mod. Disabled mods are listed too.
+  - The arrows toggle a mod on/off. This renames `libX.so` ↔ `libX.so.disabled` and takes effect on restart.
+  - Tapping the row opens the **mod page**.
+- The **mod page**, all on one scrolling page:
+  - `< back`;
+  - an `enabled` row;
+  - every key of the mod's ini, in file order:
+    - Bool keys and Choice keys (`; N = text` comments) are editable; they are saved immediately and atomically, and comments are preserved;
+    - numbers and strings are shown read-only, because there is no range source for sliders yet.
+- **Which ini belongs to a mod:** `configs/modmenu.ini` `[Links] mod=File.ini`, or a normalized-name match.
 
-  | Array | Inserted value |
-  |---|---|
-  | LeftButtons | label "mods" |
-  | FunctionToCallOnPress | "GTAML_MODS" |
-  | SelectorTabs | the options tab class |
+## How it works
+- **Entry:** on `SetTemplate`, insert into the menu template's parallel arrays (`LeftButtons`, `FunctionToCallOnPress`, `SelectorTabs`) a copy of the options tab class. Each template is patched once.
+- **Our tab:** the second `UI_Options_Menu_Tab_SA_Mobile_C` built during a patched `SetTemplate`, since tabs are built in index order.
+  - We use its first list, `ControlsOptions_C` (a `UI_ScrollingSlotList_C`).
+  - The other sub-tab buttons are collapsed. The first is relabelled via `SetButtonTextValue(Text, false)`.
+- **Rows:** `ClearSlotList`, then for each row:
+  1. `UWidgetBlueprintLibrary::Create(list, rowClass, null)`;
+  2. `AddSlotItem(row, Options, null)`. `Options` is a copy of a live row's options with `PropertyName = "GTAML_Dummy"`.
 
-  The button renders in both menus: main menu index 4, pause menu index 7. Tapping it opens a copy of the Options screen.
-- `GTAML_MODS` never reaches `CustomFunctionFromString`. A non-empty `SelectorTabs` entry opens the tab instead.
+  `UGameterSettings` Get/Set with an unknown name return defaults and do nothing (`docs/bp_decompiled.md`), so the game's row logic can't touch real settings.
+- **Texts:** applied on the next `Tick`, after `InitSlotButton`. Message rows use `OverrideMainText` / `OverrideAltText`; Selection rows use `OptionNameText` / `SelectionText`.
+- **Input:** for our rows we swallow the arrow `BndEvt__*OnButtonClickedEvent`, the body (`OnSlotClicked`, other `BndEvt` clicks) and `UpdateSettings` / `FinalCheck` / `Next` / `PreviousSelection`. Then we act ourselves, once per tap.
+- **Rebuilds:** if the game refills the list, its new row Constructs trigger a rebuild on the next `Tick`.
+- **Write detector:** while the screen exists, hooks on `UGameterSettings::Set{Bool,Int,Float}Value` log any write. None were seen in testing.
 
-## Click events
-`InteractedButton(int32 type, int32 index, ...)` fires on the menu (`UI_MainMenu_C` / `UI_PauseMenu_C`).
-
-| type | Meaning |
-|---|---|
-| 1 | press |
-| 2 | release |
-| 0 | click |
-| 3 | hover |
-| 4 | unhover |
-
-**Trigger for the Mods screen:** type 0 with index equal to the inserted index.
-
-## Next: the screen
-- After the trigger, find the tab widget that was just shown in `WidgetSwitcher 'SelectorWidget'`. It is a `UI_Options_Menu_Tab_SA_Mobile_C` containing a `UI_ScrollingSlotList_C`.
-- Clear it (`UI_ScrollingSlotList_C::ClearSlotList`), then add rows:
-  - Bool rows for mods;
-  - Bool, Selection or Slider rows for ini keys, using the template's `BoolSlotClass` / `SelectionSlotClass` / `SliderSlotClass`.
-- Still unknown: the row setter and change-event functions. Get them from the `CLS` dumps in `uidump4.log`.
-- Backend: `mods/modmenu/modmenu_core.*`, host-tested.
+## Limits
+- Numeric and string ini keys are read-only. A slider needs min/max, which the ini doesn't provide.
+- Gamepad navigation is untested.

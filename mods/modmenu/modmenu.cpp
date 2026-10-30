@@ -1,11 +1,12 @@
-// ModMenu: adds a "mods" entry to the pause/main menu. Pressing it opens the Options tab's rows
-// as a mods screen: each row shows a mod's on/off state or an ini key's value.
+// ModMenu: adds a "mods" entry to the pause/main menu: a list of installed mods (on/off), and per mod
+// a page with its ini settings. Rows are created with the game's own widgets (AddSlotItem).
 // Logcat tag: ModMenu.
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #include <algorithm>
 #include <map>
 #include <string>
@@ -52,11 +53,12 @@ static TextFromString_Fn g_textFromString;
 static Malloc_Fn g_malloc;
 static Realloc_Fn g_realloc;
 
-enum NameId { N_SetTemplate, N_InteractedButton, N_Construct, N_Destruct, N_FinalCheck, N_OptionChanged,
-              N_OnOptionSelChanged, N_OnOptionPressed, N_SlotButtonPressed, N_Tick, N_COUNT };
+enum NameId { N_SetTemplate, N_InteractedButton, N_Construct, N_Destruct, N_FinalCheck, N_Tick, N_OnSlotClicked,
+              N_UpdateSettings, N_NextSel, N_PrevSel, N_InteractedSel, N_COUNT };
 static const char* const kNames[N_COUNT] = {"SetTemplate", "InteractedButton", "Construct", "Destruct",
-                                            "On Option Changed Final Check", "OptionChanged",
-                                            "OnOptionSelectionChanged", "OnOptionPressed", "SlotButtonPressed", "Tick"};
+                                            "On Option Changed Final Check", "Tick", "OnSlotClicked",
+                                            "UpdateSettings", "NextSelection", "PreviousSelection",
+                                            "InteractedWithSelectionSlot"};
 static FNameRaw g_name[N_COUNT];
 
 static const char kModsLabel[] = "mods";
@@ -208,69 +210,42 @@ static int32_t MenuModsIndex(const void* menu) {
     return -1;
 }
 
-// ---- Mods screen ---------------------------------------------------------------
-// Row widgets of the Options tab's five lists (page order). Each list is built with its own rows.
-static const char* const kLists[5] = {"ControlsOptions_C", "GameplayOptions_C", "GraphicsOptions_C",
-                                      "AudioOptions_C", "LanguageOptions_C"};
-static void* g_lists[5];
-static void* g_tab;               // the Options tab instance hosting the mods screen; null when closed
+
+// ---- Mods screen -----------------------------------------------------------------
+// The "mods" button opens a copy of the Options tab (UI_Options_Menu_Tab_SA_Mobile_C, a UI_TabbedLayout_C).
+// We keep its first list (ControlsOptions_C, a UI_ScrollingSlotList_C), hide the other sub-tabs, clear the list
+// and fill it with our own rows: AddSlotItem(row, Options, Settings) exactly like the game's lists do
+// (docs/bp_decompiled.md). Each row's Options.PropertyName is a dummy name, which UGameterSettings ignores
+// (Get* return defaults, Set* do nothing), so the game's own row logic can never touch real settings.
+static void* g_tab;               // our Options-tab instance; null when no menu holds one
+static void* g_list;              // its ControlsOptions_C list
 static int g_optTabs = -1;        // options tabs constructed since a patched SetTemplate; -1 = idle
-static bool g_noteShown;          // the page-0 header row carries the restart note
+static bool g_needBuild;          // (re)fill the list on the next Tick
+static bool g_creating;           // we are adding rows: their Construct is ours
+static bool g_tabsDone;           // sub-tab headers relabelled/hidden
+static int g_view = -1;           // -1 = mod list, else ModList index of the open mod page
+static std::vector<void*> g_origRows;  // the game's own rows in g_list (prototypes for our rows)
 
 static std::string g_modsDir, g_cfgDir;
 static modmenu::ModList g_mods;
-static std::vector<modmenu::IniDoc> g_docs;  // one per linked ini file; Entry::doc indexes it
+static std::vector<modmenu::IniDoc> g_docs;  // ini of the open mod page (0 or 1 entries)
 
-enum class RowKind { Bool, Selection, Message, Slider, Blank };
-
-struct Entry {
-    bool isMod = false;
-    size_t mod = 0;        // ModList index when isMod
-    size_t doc = 0;        // g_docs index otherwise
-    std::string id;        // ini key id
-    std::string label;     // row caption
-    modmenu::ValueKind kind = modmenu::ValueKind::Bool;
-    bool assigned = false;
-};
-static std::vector<Entry> g_entries;
-
+enum class RowKind { Selection, Message };
+enum class Act { None, OpenMod, ToggleMod, IniKey, Back };
 struct Row {
     void* obj;
     RowKind kind;
-    int page;
-    int entry;  // index into g_entries, -1 when the row shows nothing
-    bool note = false;   // page-0 header carrying the restart note
-    bool dirty = false;  // texts must be (re)applied on the next Tick: the game sets its own after Construct
+    Act act;
+    size_t mod;         // ModList index (OpenMod/ToggleMod)
+    std::string key;    // ini key id (IniKey)
+    std::string label, value;
+    bool dirty;         // texts are applied on the next Tick, after the game's own init has run
 };
 static std::vector<Row> g_rows;
-
-static bool KindOf(const char* cn, RowKind& k) {
-    static const struct { const char* part; RowKind kind; } kinds[] = {
-        {"_Bool_", RowKind::Bool}, {"_Selection_", RowKind::Selection}, {"_Message_", RowKind::Message},
-        {"_Slider_", RowKind::Slider}, {"_Blank_", RowKind::Blank}};
-    for (const auto& e : kinds) if (strstr(cn, e.part)) { k = e.kind; return true; }
-    return false;
-}
-
-static int PageOf(const char* cn) {
-    for (int i = 0; i < 5; ++i) if (strcmp(cn, kLists[i]) == 0) return i;
-    return -1;
-}
-
-static bool IsList(const void* obj) {
-    for (void* l : g_lists) if (l && l == obj) return true;
-    return false;
-}
 
 static Row* FindRow(const void* obj) {
     for (Row& r : g_rows) if (r.obj == obj) return &r;
     return nullptr;
-}
-
-// Row pointer stored in an event's parameter block at byte offset off.
-static Row* RowAt(void* parms, size_t off) {
-    void* p = nullptr;
-    return parms && Rd((uint8_t*)parms + off, p) ? FindRow(p) : nullptr;
 }
 
 static void* PtrProp(void* obj, const char* name) {
@@ -280,45 +255,40 @@ static void* PtrProp(void* obj, const char* name) {
     return p && Rd(p + UE::Prop_Offset, off) && Rd((uint8_t*)obj + off, v) ? v : nullptr;
 }
 
-// Page of the list that owns a row: walk widget parents (Slot->Parent), testing each widget's Outer chain
-// (panel -> WidgetTree -> list widget). -1 for rows of any other list, e.g. the real Options tab.
-static int PageOfRow(void* row) {
+// True if a widget sits (transitively) inside our list: walk widget parents (Slot->Parent) and each
+// widget's Outer chain (panel -> WidgetTree -> list widget).
+static bool InOurList(void* row) {
     for (void* w = row; w; w = PtrProp(PtrProp(w, "Slot"), "Parent")) {
         void* o = w;
         for (int i = 0; i < 3 && o; ++i) {
             if (!Rd((uint8_t*)o + UE::Obj_Outer, o)) break;
-            for (int p = 0; p < 5; ++p) if (o && o == g_lists[p]) return p;
+            if (o && o == g_list) return true;
         }
     }
-    return -1;
+    return false;
 }
 
-static bool Fits(const Entry& e, RowKind k) {
-    switch (e.kind) {
-    case modmenu::ValueKind::Bool: return k == RowKind::Bool || k == RowKind::Selection;
-    case modmenu::ValueKind::Choice: return k == RowKind::Selection;
-    default: return k == RowKind::Message;  // Int, Float, String
-    }
-}
-
-// ---- Calls into the game (bypass our hook) ----------------------------------------
 static FTextRaw ToText(const std::string& s) {
-    std::u16string w(s.size() + 1, u'\0');  // NUL-terminated
+    std::u16string w(s.size() + 1, u'\0');
     for (size_t i = 0; i < s.size(); ++i) w[i] = (unsigned char)s[i] < 128 ? (char16_t)s[i] : u'?';
     FString f = {w.data(), (int32_t)w.size(), (int32_t)w.size()};
     return g_textFromString(f);
 }
 
-// Calls UFunction name on obj with a zeroed 128-byte parameter block holding args.
-static void CallFn(void* obj, const char* name, const void* args, size_t n) {
+static void* FindFn(void* obj, const char* name) {
     FNameRaw nm = {0, 0};
     g_FNameCtor(&nm, name, 0);
-    void* cls = ClassOf(obj);
+    void* cls = obj ? ClassOf(obj) : nullptr;
     uint64_t key;
     memcpy(&key, &nm, sizeof key);
-    void* fn = nm.Index > 0 && cls ? g_findFn(cls, key, 1) : nullptr;
+    return nm.Index > 0 && cls ? g_findFn(cls, key, 1) : nullptr;
+}
+
+// Calls UFunction name on obj with a zeroed parameter block starting with args.
+static void CallFn(void* obj, const char* name, const void* args, size_t n) {
+    void* fn = FindFn(obj, name);
     if (!fn) { LOG("no function %s", name); return; }
-    alignas(16) uint8_t parms[128] = {};
+    alignas(16) uint8_t parms[256] = {};
     memcpy(parms, args, n);
     o_ProcessEvent(obj, fn, parms);
 }
@@ -329,146 +299,245 @@ static void CallText(void* obj, const char* name, const std::string& text) {
 }
 
 static void SetTextProp(void* obj, const char* prop, const std::string& text) {
-    uint8_t* p = FindProp(obj, prop);
-    int32_t off = 0;
-    void* tb = nullptr;
-    if (!p || !Rd(p + UE::Prop_Offset, off) || !Rd((uint8_t*)obj + off, tb) || !tb) return;
-    CallText(tb, "SetText", text);
+    if (void* tb = PtrProp(obj, prop)) CallText(tb, "SetText", text);
 }
 
-static void Collapse(void* obj) {
-    uint8_t collapsed = 1;  // ESlateVisibility::Collapsed
-    CallFn(obj, "SetVisibility", &collapsed, 1);
+static void SetVisible(void* w, bool on) {
+    uint8_t v = on ? 0 : 1;  // ESlateVisibility: Visible / Collapsed
+    CallFn(w, "SetVisibility", &v, 1);
 }
 
-// ---- Entries and values -----------------------------------------------------------
-static std::string ValueText(const Entry& e) {
-    if (e.isMod) return g_mods.At(e.mod).enabled ? "ON" : "OFF";
-    const modmenu::IniKey* k = g_docs[e.doc].Find(e.id);
-    if (!k) return "?";
-    if (e.kind == modmenu::ValueKind::Bool) return k->value == "1" ? "ON" : "OFF";
-    if (e.kind == modmenu::ValueKind::Choice)
-        for (const modmenu::Label& l : k->labels) if (std::to_string(l.value) == k->value) return l.text;
-    return k->value;
+static int32_t ParmOffset(void* fn, const char* name) {
+    FNameRaw nm = {0, 0};
+    g_FNameCtor(&nm, name, 0);
+    uint64_t key;
+    memcpy(&key, &nm, sizeof key);
+    uint8_t* p = nm.Index > 0 ? (uint8_t*)g_findProp(fn, key) : nullptr;
+    int32_t off = -1;
+    return p && Rd(p + UE::Prop_Offset, off) ? off : -1;
 }
 
-static void Render(const Row& r) {
-    if (r.note) { CallText(r.obj, "OverrideMainText", "Mod on/off takes effect after restart"); return; }
-    if (r.entry < 0) return;
-    const Entry& e = g_entries[r.entry];
-    if (r.kind == RowKind::Message) { CallText(r.obj, "OverrideMainText", e.id + " = " + ValueText(e)); return; }
-    SetTextProp(r.obj, "OptionNameText", e.label);
-    SetTextProp(r.obj, "SelectionText", ValueText(e));
+// ---- Values ------------------------------------------------------------------------
+static std::string KeyValueText(const modmenu::IniKey& k) {
+    if (k.kind == modmenu::ValueKind::Bool) return k.value == "1" ? "ON" : "OFF";
+    if (k.kind == modmenu::ValueKind::Choice)
+        for (const modmenu::Label& l : k.labels) if (std::to_string(l.value) == k.value) return l.text;
+    return k.value;
 }
 
-// Advances an entry one step: toggles a mod or an ini key, then saves the ini file.
-static void Step(Entry& e, int dir) {
-    if (e.isMod) {
-        if (!g_mods.SetEnabled(e.mod, !g_mods.At(e.mod).enabled)) LOG("could not toggle %s", e.label.c_str());
-        return;
-    }
-    modmenu::IniDoc& doc = g_docs[e.doc];
-    const modmenu::IniKey* k = doc.Find(e.id);
+static std::string ModState(size_t i) { return g_mods.At(i).enabled ? "ON" : "OFF"; }
+
+// Steps an ini key (Bool toggles, Choice cycles its labels) and saves the file.
+static void StepKey(const std::string& id, int dir) {
+    if (g_docs.empty()) return;
+    modmenu::IniDoc& doc = g_docs[0];
+    const modmenu::IniKey* k = doc.Find(id);
     if (!k) return;
     std::string next;
-    if (e.kind == modmenu::ValueKind::Bool) {
+    if (k->kind == modmenu::ValueKind::Bool) {
         next = k->value == "1" ? "0" : "1";
-    } else {
+    } else if (k->kind == modmenu::ValueKind::Choice && !k->labels.empty()) {
         const std::vector<modmenu::Label>& L = k->labels;
         const int n = (int)L.size();
-        if (n == 0) return;
         int i = -1;
         for (int j = 0; j < n; ++j) if (std::to_string(L[j].value) == k->value) i = j;
         if (i < 0) i = dir > 0 ? -1 : n;
         next = std::to_string(L[((i + dir) % n + n) % n].value);
+    } else {
+        return;  // shortcut: numbers/strings are read-only here; add slider rows when a range source exists
     }
-    if (!doc.Set(e.id, next) || !doc.Save()) LOG("could not save %s", e.id.c_str());
+    if (!doc.Set(id, next) || !doc.Save()) LOG("could not save %s", id.c_str());
 }
 
-// Fills g_entries: every mod first, then the keys of its linked ini file.
-static void BuildEntries() {
-    g_entries.clear();
-    g_docs.clear();
-    g_mods.Scan(g_modsDir);
-    for (size_t i = 0; i < g_mods.Count(); ++i) {
-        Entry e;
-        e.isMod = true;
-        e.mod = i;
-        e.label = g_mods.At(i).name;
-        e.kind = modmenu::ValueKind::Bool;
-        g_entries.push_back(e);
-    }
+// ---- Building rows -------------------------------------------------------------------
+struct Proto { void* cls; uint8_t* options; };  // a live row of that kind; options points into it
 
-    modmenu::IniDoc cfg;
-    std::map<std::string, std::string> links;
-    if (cfg.Load(g_cfgDir + "/modmenu.ini")) links = modmenu::ParseLinks(cfg);
-    const std::vector<std::string> inis = modmenu::ListConfigs(g_cfgDir);
-    std::vector<std::string> used;
-    for (size_t i = 0; i < g_mods.Count(); ++i) {
-        const std::string ini = modmenu::FindIni(g_mods.At(i).name, inis, links);
-        if (ini.empty() || std::find(used.begin(), used.end(), ini) != used.end()) continue;
-        used.push_back(ini);
-        g_docs.emplace_back();
-        if (!g_docs.back().Load(g_cfgDir + "/" + ini)) {
-            LOG("could not read %s", ini.c_str());
-            g_docs.pop_back();
-            continue;
+static bool TakeProto(void* row, Proto& p) {
+    uint8_t* prop = FindProp(row, "Options");
+    int32_t off = 0;
+    if (!prop || !Rd(prop + UE::Prop_Offset, off)) return false;
+    p = {ClassOf(row), (uint8_t*)row + off};
+    return true;
+}
+
+static void* (*g_wblCreate)(void* worldCtx, void* cls, void* owningPlayer);  // UWidgetBlueprintLibrary::Create
+static FNameRaw g_dummyName;
+
+// Creates a row of proto's class and adds it with a copy of proto's Options whose PropertyName is the dummy.
+static void AddRow(const Proto& proto, RowKind kind, Act act, size_t mod, const std::string& key,
+                   const std::string& label, const std::string& value) {
+    void* addFn = FindFn(g_list, "AddSlotItem");
+    if (!addFn || !g_wblCreate) return;
+    const int32_t oItem = ParmOffset(addFn, "Slot Item"), oOpts = ParmOffset(addFn, "Options");
+    int32_t size = 0;
+    Rd((uint8_t*)addFn + 0x58, size);  // UStruct::PropertiesSize
+    uint8_t* structObj = nullptr;  // FStructProperty::Struct of the Options parameter
+    {
+        FNameRaw nm = {0, 0};
+        g_FNameCtor(&nm, "Options", 0);
+        uint64_t k;
+        memcpy(&k, &nm, sizeof k);
+        uint8_t* p = (uint8_t*)g_findProp(addFn, k);
+        if (p) Rd(p + UE::Prop_Inner, structObj);
+    }
+    int32_t oName = structObj ? ParmOffset(structObj, "PropertyName") : -1;
+    if (oItem < 0 || oOpts < 0 || oName < 0 || size <= 0 || size > 1024) {
+        LOG("AddSlotItem layout unexpected (%d %d %d %d)", oItem, oOpts, oName, size);
+        return;
+    }
+    g_creating = true;
+    void* row = g_wblCreate(g_list, proto.cls, nullptr);
+    if (!row) { g_creating = false; LOG("create row failed"); return; }
+    alignas(16) uint8_t parms[1024] = {};
+    memcpy(parms + oItem, &row, 8);
+    // Shallow copy of a live row's Options; the callee deep-copies it into the new row (Slot.Options = Options).
+    memcpy(parms + oOpts, proto.options, 0x90);
+    memcpy(parms + oOpts + oName, &g_dummyName, sizeof g_dummyName);
+    o_ProcessEvent(g_list, addFn, parms);  // SettingsObject stays null
+    g_creating = false;
+    g_rows.push_back(Row{row, kind, act, mod, key, label, value, true});
+}
+
+static void Render(Row& r) {
+    if (r.kind == RowKind::Message) {
+        CallText(r.obj, "OverrideMainText", r.label);
+        CallText(r.obj, "OverrideAltText", r.value);
+        return;
+    }
+    SetTextProp(r.obj, "OptionNameText", r.label);
+    SetTextProp(r.obj, "SelectionText", r.value);
+}
+
+// Clears the list and fills it with the current view: the mod list, or one mod's page.
+static void Build() {
+    Proto sel = {}, msg = {};
+    auto consider = [&](void* row) {
+        char cn[128];
+        NameStr(ClassOf(row), cn, sizeof cn);
+        if (!sel.cls && (strstr(cn, "_Selection_") || strstr(cn, "_Bool_"))) TakeProto(row, sel);
+        if (!msg.cls && strstr(cn, "_Message_")) TakeProto(row, msg);
+    };
+    for (Row& r : g_rows) consider(r.obj);
+    for (void* r : g_origRows) consider(r);
+    if (!sel.cls || !msg.cls) { LOG("no row prototypes yet"); return; }
+
+    CallFn(g_list, "ClearSlotList", nullptr, 0);
+    std::vector<Row> old;
+    old.swap(g_rows);  // the old rows stay alive until GC; protos above point into them for this call
+    g_origRows.clear();
+
+    g_mods.Scan(g_modsDir);
+    if (g_view >= (int)g_mods.Count()) g_view = -1;
+    if (g_view < 0) {
+        char head[96];
+        snprintf(head, sizeof head, "%zu mod%s installed", g_mods.Count(), g_mods.Count() == 1 ? "" : "s");
+        AddRow(msg, RowKind::Message, Act::None, 0, "", head, "changes apply after restart");
+        for (size_t i = 0; i < g_mods.Count(); ++i)
+            AddRow(sel, RowKind::Selection, Act::OpenMod, i, "", g_mods.At(i).name, ModState(i) + "  >");
+    } else {
+        const size_t m = (size_t)g_view;
+        AddRow(msg, RowKind::Message, Act::Back, 0, "", "<  back", g_mods.At(m).name);
+        AddRow(sel, RowKind::Selection, Act::ToggleMod, m, "", "enabled", ModState(m));
+        g_docs.clear();
+        modmenu::IniDoc cfg;
+        std::map<std::string, std::string> links;
+        if (cfg.Load(g_cfgDir + "/modmenu.ini")) links = modmenu::ParseLinks(cfg);
+        const std::string ini = modmenu::FindIni(g_mods.At(m).name, modmenu::ListConfigs(g_cfgDir), links);
+        if (!ini.empty()) {
+            g_docs.emplace_back();
+            if (!g_docs[0].Load(g_cfgDir + "/" + ini)) { LOG("could not read %s", ini.c_str()); g_docs.clear(); }
         }
-        for (const modmenu::IniKey& k : g_docs.back().Keys()) {
-            Entry e;
-            e.doc = g_docs.size() - 1;
-            e.id = k.id;
-            e.label = k.id;
-            e.kind = k.kind;
-            g_entries.push_back(e);
+        if (g_docs.empty()) AddRow(msg, RowKind::Message, Act::None, 0, "", "no settings file", "");
+        else
+            for (const modmenu::IniKey& k : g_docs[0].Keys()) {
+                const bool editable = k.kind == modmenu::ValueKind::Bool ||
+                                      (k.kind == modmenu::ValueKind::Choice && !k.labels.empty());
+                if (editable) AddRow(sel, RowKind::Selection, Act::IniKey, m, k.id, k.id, KeyValueText(k));
+                else AddRow(msg, RowKind::Message, Act::None, m, k.id, k.id, k.value);
+            }
+    }
+    LOG("view %d: %zu rows", g_view, g_rows.size());
+}
+
+// Sub-tab headers: rename the first ("mods (N)"), hide the rest. Children of UI_TabbedLayout_C.TabButtons
+// are UI_Button_Base_C labelled via SetButtonTextValue(Text, JustRebuild=false).
+static void FixTabs() {
+    void* box = PtrProp(g_tab, "TabButtons");
+    uint8_t* sp = box ? FindProp(box, "Slots") : nullptr;
+    int32_t off = 0;
+    TArrayRaw slots = {};
+    if (!sp || !Rd(sp + UE::Prop_Offset, off) || !Rd((uint8_t*)box + off, slots) || slots.num < 1) return;
+    for (int i = 0; i < slots.num && i < 16; ++i) {
+        void* slot = nullptr;
+        void* btn = Rd(slots.data + i * 8, slot) ? PtrProp(slot, "Content") : nullptr;
+        if (!btn) return;
+        if (i == 0) {
+            char t[32];
+            snprintf(t, sizeof t, "mods (%zu)", g_mods.Count());
+            struct { FTextRaw text; bool justRebuild; } args = {ToText(t), false};
+            CallFn(btn, "SetButtonTextValue", &args, sizeof args);
+        } else {
+            SetVisible(btn, false);
         }
     }
+    g_tabsDone = true;
+}
+
+static void Activate(Row& r, int dir) {  // dir: +1 next / -1 previous / 0 body tap
+    switch (r.act) {
+    case Act::OpenMod:
+        if (dir == 0) { g_view = (int)r.mod; g_needBuild = true; return; }
+        /* fallthrough: arrows toggle the mod from the list */
+    case Act::ToggleMod:
+        if (!g_mods.SetEnabled(r.mod, !g_mods.At(r.mod).enabled)) LOG("could not toggle %s", g_mods.At(r.mod).name.c_str());
+        r.value = ModState(r.mod) + (r.act == Act::OpenMod ? "  >" : "");
+        LOG("mod %s -> %s", g_mods.At(r.mod).name.c_str(), ModState(r.mod).c_str());
+        break;
+    case Act::IniKey:
+        StepKey(r.key, dir ? dir : 1);
+        if (const modmenu::IniKey* k = g_docs.empty() ? nullptr : g_docs[0].Find(r.key)) r.value = KeyValueText(*k);
+        LOG("%s -> %s", r.key.c_str(), r.value.c_str());
+        break;
+    case Act::Back:
+        g_view = -1;
+        g_needBuild = true;
+        return;
+    case Act::None:
+        return;
+    }
+    r.dirty = true;
 }
 
 static void StopCapture() {
-    size_t left = 0;
-    for (const Entry& e : g_entries) left += !e.assigned;
-    if (g_tab && left) LOG("mods screen: %zu entries did not fit", left);
-    g_tab = nullptr;
-    for (void*& l : g_lists) l = nullptr;
+    g_tab = g_list = nullptr;
     g_rows.clear();
-    g_entries.clear();
+    g_origRows.clear();
     g_docs.clear();
+    g_needBuild = false;
 }
 
-static void StartCapture(void* tab) {
-    StopCapture();
-    g_tab = tab;
-    g_noteShown = false;
-    BuildEntries();
-    LOG("mods screen: %zu mods, %zu entries", g_mods.Count(), g_entries.size());
+// Write detector: logs any settings write while our screen exists (should never happen).
+typedef void (*SetInt_Fn)(void*, FNameRaw, int32_t);
+typedef void (*SetBool_Fn)(void*, FNameRaw, bool);
+typedef void (*SetFloat_Fn)(void*, FNameRaw, float);
+static SetInt_Fn o_SetInt;
+static SetBool_Fn o_SetBool;
+static SetFloat_Fn o_SetFloat;
+static void LogWrite(const char* what, FNameRaw n) {
+    if (!g_tab) return;
+    char buf[1024];
+    g_FNamePlain(&n, &buf);
+    LOG("GameterSettings::%s(%s) while mods screen open", what, buf);
 }
+static void H_SetInt(void* s, FNameRaw n, int32_t v) { LogWrite("SetIntValue", n); o_SetInt(s, n, v); }
+static void H_SetBool(void* s, FNameRaw n, bool v) { LogWrite("SetBoolValue", n); o_SetBool(s, n, v); }
+static void H_SetFloat(void* s, FNameRaw n, float v) { LogWrite("SetFloatValue", n); o_SetFloat(s, n, v); }
 
-// Assigns the first free entry that fits a row, or collapses the row. Called after the row's Construct.
-static void Populate(size_t ri) {
-    Row& row = g_rows[ri];
-    if (row.kind == RowKind::Slider || row.kind == RowKind::Blank) { Collapse(row.obj); return; }
-    if (row.kind == RowKind::Message && row.page == 0 && !g_noteShown) {
-        g_noteShown = true;
-        row.note = row.dirty = true;
-        return;
-    }
-    for (size_t i = 0; i < g_entries.size(); ++i) {
-        Entry& e = g_entries[i];
-        if (e.assigned || !Fits(e, row.kind)) continue;
-        e.assigned = true;
-        row.entry = (int)i;
-        break;
-    }
-    if (row.entry < 0) { Collapse(row.obj); return; }
-    row.dirty = true;
-}
-
-// Which arrow binding fired: +1 forward, -1 back, 0 none.
-static int ArrowDir(void* func) {
+// Which click binding fired on a row: +1 forward arrow, -1 back arrow, 0 body, 2 not a click.
+static int ClickDir(void* func) {
     char n[160];
     NameStr(func, n, sizeof n);
-    if (strncmp(n, "BndEvt__", 8) != 0 || !strstr(n, "OnButtonClickedEvent")) return 0;
+    if (strncmp(n, "BndEvt__", 8) != 0 || !strstr(n, "OnButtonClickedEvent")) return 2;
     if (strstr(n, "ForwardButton")) return 1;
     if (strstr(n, "BackButton")) return -1;
     return 0;
@@ -491,67 +560,67 @@ static bool Observe(void* obj, void* func, void* parms) {
         int32_t v[2] = {0, 0};  // type (0 = click), index
         if (parms) Rd(parms, v);
         const int32_t want = MenuModsIndex(obj);
-        if (v[0] == 0 && want >= 0 && v[1] == want) LOG("mods button pressed");
+        if (v[0] == 0 && want >= 0 && v[1] == want) { g_view = -1; g_needBuild = g_tab != nullptr; }
         return false;
     }
     // Our tab is the 2nd options-tab instance built after a patched SetTemplate (index order: options < mods).
     if (Is(fn, N_Construct) && g_optTabs >= 0 && ClassIs(obj, "UI_Options_Menu_Tab_SA_Mobile_C") && ++g_optTabs == 2) {
         g_optTabs = -1;
-        StartCapture(obj);
+        StopCapture();
+        g_tab = obj;
+        g_tabsDone = false;
         return false;
     }
     if (!g_tab) return false;
     if (Is(fn, N_Destruct) && obj == g_tab) { StopCapture(); return false; }
-    if (IsList(obj)) {  // our lists: the commit path would write game settings by name
-        if (Is(fn, N_OptionChanged) || Is(fn, N_OnOptionSelChanged)) return true;
-        if (Is(fn, N_OnOptionPressed)) return RowAt(parms, 0) != nullptr;
-        if (Is(fn, N_SlotButtonPressed)) return RowAt(parms, 8) != nullptr;
-        return false;
-    }
     if (Row* r = FindRow(obj)) {
-        if (Is(fn, N_Destruct)) {  // the list rebuilds its rows: free the entry for the replacement row
-            if (r->entry >= 0) g_entries[r->entry].assigned = false;
-            g_rows.erase(g_rows.begin() + (r - g_rows.data()));
-            return false;
-        }
-        if (Is(fn, N_FinalCheck)) return true;
-        const int dir = ArrowDir(func);
-        if (dir && r->entry >= 0 && (r->kind == RowKind::Bool || r->kind == RowKind::Selection)) {
-            Step(g_entries[r->entry], dir);
-            r->dirty = true;
-        }
-        return dir != 0;
+        if (Is(fn, N_Destruct)) { g_rows.erase(g_rows.begin() + (r - g_rows.data())); return false; }
+        if (Is(fn, N_FinalCheck) || Is(fn, N_UpdateSettings) || Is(fn, N_NextSel) || Is(fn, N_PrevSel) ||
+            Is(fn, N_InteractedSel))
+            return true;
+        // Body tap: SlotButton.OnClicked is bound to OnSlotClicked (docs/bp_decompiled.md).
+        const int dir = Is(fn, N_OnSlotClicked) ? 0 : ClickDir(func);
+        if (dir == 2) return false;
+        // One tap fires both OnSlotClicked and the button's BndEvt click: act once per tap.
+        static void* lastRow;
+        static int64_t lastMs;
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (!(obj == lastRow && now - lastMs < 150)) Activate(*r, dir);
+        lastRow = obj;
+        lastMs = now;
+        return true;
     }
     return false;
 }
 
-// Runs after the game handled a call: captures the lists and rows as the tab builds them.
+// After the game handled a call: track the tab's first list and the game's rows in it.
 static void AfterCall(void* obj, void* func) {
     int32_t fn = 0;
-    if (!Rd((uint8_t*)func + UE::Obj_Name, fn) || !Is(fn, N_Construct)) return;
-    char cn[128];
-    NameStr(ClassOf(obj), cn, sizeof cn);
-    // Our tab's lists are the first of each class constructed after the tab itself.
-    if (const int p = PageOf(cn); p >= 0) { if (!g_lists[p]) g_lists[p] = obj; return; }
-    RowKind k;
-    if (!KindOf(cn, k)) return;
-    const int page = PageOfRow(obj);
-    if (page < 0 || FindRow(obj)) return;
-    g_rows.push_back(Row{obj, k, page, -1});
-    Populate(g_rows.size() - 1);
-    LOG("row p%d %s -> entry %d", page, cn, g_rows.back().entry);
+    if (!Rd((uint8_t*)func + UE::Obj_Name, fn)) return;
+    if (Is(fn, N_Construct)) {
+        char cn[128];
+        NameStr(ClassOf(obj), cn, sizeof cn);
+        if (!g_list && strcmp(cn, "ControlsOptions_C") == 0) { g_list = obj; return; }
+        if (g_creating || !g_list || strncmp(cn, "UI_SlotButton_", 14) != 0 || FindRow(obj)) return;
+        if (!InOurList(obj)) return;
+        g_origRows.push_back(obj);  // the game (re)filled our list: replace its rows with ours
+        g_needBuild = true;
+        return;
+    }
+    if (Is(fn, N_Tick)) {
+        if (g_needBuild && g_list) { g_needBuild = false; Build(); }
+        if (!g_tabsDone) FixTabs();
+        for (Row& r : g_rows) if (r.dirty) { r.dirty = false; Render(r); }
+    }
 }
 
 static void Hooked_ProcessEvent(void* obj, void* func, void* parms) {
     if (!obj || !func) { o_ProcessEvent(obj, func, parms); return; }
     if (Observe(obj, func, parms)) return;
     o_ProcessEvent(obj, func, parms);
-    if (!g_tab) return;
-    AfterCall(obj, func);
-    if (Row* r = FindRow(obj)) r->dirty = true;  // any row event may have re-set the game's texts
-    int32_t fn = 0;
-    if (Rd((uint8_t*)func + UE::Obj_Name, fn) && Is(fn, N_Tick))
-        for (Row& r : g_rows) if (r.dirty) { r.dirty = false; Render(r); }
+    if (g_tab) AfterCall(obj, func);
 }
 
 static void* ResolveThread(void*) {
@@ -578,7 +647,7 @@ static void* ResolveThread(void*) {
 ON_MOD_LOAD() {
     void* h = (void*)aml->GetLibHandle("libUE4.so");
     if (!h) { LOG("ABORT: libUE4.so not loaded"); return; }
-    void *pe, *ctor, *plain, *find, *findFn, *toStr, *fromStr, *mal, *real;
+    void *pe, *ctor, *plain, *find, *findFn, *toStr, *fromStr, *mal, *real, *create;
     struct Sym { const char* sym; void** out; } syms[] = {
         {"_ZN7UObject12ProcessEventEP9UFunctionPv", &pe},
         {"_ZN5FNameC1EPKc9EFindName", &ctor},
@@ -589,6 +658,7 @@ ON_MOD_LOAD() {
         {"_ZN5FText10FromStringERK7FString", &fromStr},
         {"_ZN7FMemory6MallocEyj", &mal},
         {"_ZN7FMemory7ReallocEPvyj", &real},
+        {"_ZN23UWidgetBlueprintLibrary6CreateEP7UObject11TSubclassOfI11UUserWidgetEP17APlayerController", &create},
     };
     for (Sym& s : syms)
         if (!(*s.out = (void*)aml->GetSym(h, s.sym))) { LOG("ABORT: missing %s", s.sym); return; }
@@ -600,9 +670,20 @@ ON_MOD_LOAD() {
     g_textFromString = (TextFromString_Fn)fromStr;
     g_malloc = (Malloc_Fn)mal;
     g_realloc = (Realloc_Fn)real;
+    g_wblCreate = (void* (*)(void*, void*, void*))create;
+    g_FNameCtor(&g_dummyName, "GTAML_Dummy", 1);  // FNAME_Add
     g_modsDir = std::string(aml->GetAndroidDataRootPath()) + "/mods";  // where AML loads *.so from
     g_cfgDir = aml->GetConfigPath();
     if (!aml->Hook(pe, (void*)&Hooked_ProcessEvent, (void**)&o_ProcessEvent)) { LOG("ABORT: hook failed"); return; }
+    const struct { const char* sym; void* fn; void** orig; } writes[] = {
+        {"_ZN16UGameterSettings11SetIntValueE5FNamei", (void*)&H_SetInt, (void**)&o_SetInt},
+        {"_ZN16UGameterSettings12SetBoolValueE5FNameb", (void*)&H_SetBool, (void**)&o_SetBool},
+        {"_ZN16UGameterSettings13SetFloatValueE5FNamef", (void*)&H_SetFloat, (void**)&o_SetFloat},
+    };
+    for (const auto& w : writes) {
+        void* a = (void*)aml->GetSym(h, w.sym);
+        if (!a || !aml->Hook(a, w.fn, w.orig)) LOG("write detector: cannot hook %s", w.sym);
+    }
     pthread_t th;
     pthread_create(&th, nullptr, ResolveThread, nullptr);
     pthread_detach(th);
