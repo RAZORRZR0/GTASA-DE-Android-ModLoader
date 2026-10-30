@@ -7,10 +7,12 @@ Adds a **mods** entry to the pause menu (and main menu), placed before *exit*. T
   - `ModList` turns a mod on/off by renaming `x.so` ↔ `x.so.disabled`. The change applies on restart.
   - `IniDoc` is a comment-preserving ini parser. It infers Bool/Choice/Int/Float from the `; N = text` comments and saves atomically.
   - Mods are linked to inis by normalized name, or through `configs/modmenu.ini` `[Links]`.
-- **Step A (`modmenu.cpp`)**: entry injection, plus event discovery logs.
-  - On `SetTemplate`, it inserts the label `mods`, the function `GTAML_MODS` and a copy of the options tab class into the template's parallel arrays. Each template is patched once.
-  - It logs `InteractedButton`, the `CustomFunction*` strings, and the first call of each `UI_PauseMenu_C` function.
-- **Pending**: the screen itself. That means rows built from the game's `UI_OptionButton_*_Mobile_C` widgets inside the options tab, plus change handling.
+- **Mods screen (`modmenu.cpp`)**: pressing `mods` opens the Options tab's rows as a mods screen.
+  - Each mod shows ON/OFF. Each ini key shows its value, from the ini linked to the mod. Choice keys cycle their labels on arrow press.
+  - Mod and ini changes are saved at once. Mod on/off applies after restart (a header row says so).
+  - Rows that do not fit a free entry are collapsed. Slider and blank rows are always collapsed.
+  - It logs `mods button pressed` and `mods screen: N mods, M entries` on open.
+- **Pending**: on-device verification. Only the host core is tested.
 
 ## Build / test
 ```
