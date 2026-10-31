@@ -15,6 +15,7 @@ struct Offsets {
     uint32_t colorGain = 0, colorSat = 0, colorContrast = 0, exposureBias = 0;
     uint32_t film[5] = {};          // FilmSlope, FilmToe, FilmShoulder, FilmBlackClip, FilmWhiteClip
     uint32_t todSkyLight = 0;       // AGTATimeOfDay::SkyLightIntensity
+    uint32_t todSun = 0;            // AGTATimeOfDay::SunBaseIntensity, 0 = unresolved (SunStrength off)
     uint8_t ovGain[2] = {0, 0}, ovSat[2] = {0, 0}, ovContrast[2] = {0, 0}, ovExposure[2] = {0, 0};
     uint8_t ovFilm[5][2] = {};      // bOverride_Film* as (byte, mask), same order as film[]
     bool ok = false;
@@ -55,6 +56,7 @@ bool Resolve() {
               FieldOffset(g_settingsStruct, "ColorContrast", &o.colorContrast) &&
               FieldOffset(g_settingsStruct, "AutoExposureBias", &o.exposureBias) &&
               FieldOffset(todCls, "SkyLightIntensity", &o.todSkyLight);
+    if (ok && !FieldOffset(todCls, "SunBaseIntensity", &o.todSun)) SKY_LOG("colour: SunBaseIntensity unresolved, SunStrength off");
     for (int k = 0; ok && k < 5; ++k)
         ok = FieldOffset(g_settingsStruct, kFilm[k], &o.film[k]) &&
              BoolBit(g_settingsStruct, kOvFilm[k], &o.ovFilm[k][0], &o.ovFilm[k][1]);
@@ -218,6 +220,14 @@ void OnTodUpdate(void* self, void*, float, float) {
     const float indirect = Clamp(1.0f - cfg.shadowDarkness * shadowStrength / 255.0f, 0.1f, 1.0f);
     skyWritten = skyDE * indirect;
     *sp = skyWritten;
+    // [ModernLook] SunStrength (PC core.cpp PerFrame): DE's base sun intensity x the setting, DE's value re-captured
+    // when DE rewrites it or the time-of-day actor changes.
+    if (!o.todSun) return;
+    static float* sunP = nullptr;
+    static float sunDE = 0.0f, sunWritten = NAN;
+    float* sun = (float*)((uint8_t*)self + o.todSun);
+    if (sun != sunP || *sun != sunWritten) { sunP = sun; sunDE = *sun; }
+    sunWritten = *sun = sunDE * (cfg.enabled ? cfg.sunStrength : 1.0f);
 }
 
 void Init() {

@@ -59,9 +59,7 @@ void Pending_Weather() {
 
 void BeforeWeather() {
     const int hour = g_setHour.exchange(-1);
-    if (hour >= 0) {
-        g_SetGameClock((uint8_t)hour, (uint8_t)g_setMinute.load(), 0);
-    }
+    if (hour >= 0) g_SetGameClock((uint8_t)hour, (uint8_t)g_setMinute.load(), 0);
     if (!g_baseMsPerMinute && *g_msPerMinute) g_baseMsPerMinute = *g_msPerMinute;
     if (g_baseMsPerMinute) {
         const float want = g_timelapse.load() ? kTimelapseSpeed : g_timeSpeed.load();
@@ -124,11 +122,20 @@ typedef uint8_t* (*FindPlayerVehicle_Fn)(int, bool);
 typedef uint8_t* (*GetPad_Fn)(int);
 typedef int32_t (*PadAxis_Fn)(void* pad, bool, int);
 typedef void (*CameraProcess_Fn)(void* self);
+typedef void (*DerivedValues_Fn)(void* self, bool, bool);
+typedef void (*CopyToRw_Fn)(void* self, bool);
 FindPlayerEntity_Fn g_FindPlayerEntity = nullptr;
 FindPlayerVehicle_Fn g_FindPlayerVehicle = nullptr;
 GetPad_Fn g_GetPad = nullptr;
 PadAxis_Fn o_PadLeftRight = nullptr, o_PadUpDown = nullptr;
 CameraProcess_Fn o_CameraProcess = nullptr;
+// CCamera::Process ends with CalculateDerivedValues(this, false, true) (0x5427ad8) and CopyCameraMatrixToRWCam(this,
+// false) (0x5427ae4), which hands TheCamera to UE's view. A matrix written after Process returns is only rendered if
+// both run again with it.
+DerivedValues_Fn g_CalculateDerivedValues = nullptr;
+CopyToRw_Fn g_CopyCameraMatrixToRWCam = nullptr;
+const uint8_t* g_cutsceneRunning = nullptr;  // CCutsceneMgr::ms_running
+constexpr uint32_t kOffLodMult = 0x104;      // TheCamera.m_fLODDistMultiplier (CCamera::Process 0x5427b40: 70 / FOV)
 
 float* CameraMatrix() { return g_theCamera ? *(float**)(g_theCamera + kOffCamMatrix) : nullptr; }
 
@@ -210,6 +217,8 @@ void AfterCamera(float dt) {
         cm[4] = cp * cy; cm[5] = cp * sn; cm[6] = sp;
         cm[8] = -sp * cy; cm[9] = -sp * sn; cm[10] = cp;
         memcpy(cm + 12, g_camPos, 12);
+        g_CalculateDerivedValues(g_theCamera, false, true);
+        g_CopyCameraMatrixToRWCam(g_theCamera, false);
     } else {
         g_freecamInit = false;
     }
@@ -223,8 +232,11 @@ void AfterCamera(float dt) {
     }
 }
 
+// PC tools.cpp Hooked_CameraProcess: [World] LodDistance scales DE's m_fLODDistMultiplier (DE dropped the PC draw
+// distance factor from 70 / FOV) before this frame's render list is built; cutscenes keep DE's value, as the original.
 void Hooked_CameraProcess(void* self) {
     o_CameraProcess(self);
+    if (cfg.enabled && !*g_cutsceneRunning) *(float*)(g_theCamera + kOffLodMult) *= cfg.lodDistance;
     AfterCamera(*g_timeStep / 30.0f);
 }
 
@@ -247,8 +259,12 @@ void InstallFreecam() {
     g_GetPad = (GetPad_Fn)Sym("_ZN4CPad6GetPadEi");
     g_theCamera = (uint8_t*)Sym("TheCamera");
     g_timeStep = (float*)Sym("_ZN6CTimer12ms_fTimeStepE");
-    if (!camProcess || !padLR || !padUD || !g_FindPlayerEntity || !g_FindPlayerVehicle || !g_GetPad || !g_theCamera || !g_timeStep) {
-        SKY_LOG("tools: freecam/noclip symbols missing, disabled");
+    g_CalculateDerivedValues = (DerivedValues_Fn)Sym("_ZN7CCamera22CalculateDerivedValuesEbb");
+    g_CopyCameraMatrixToRWCam = (CopyToRw_Fn)Sym("_ZN7CCamera23CopyCameraMatrixToRWCamEb");
+    g_cutsceneRunning = (const uint8_t*)Sym("_ZN12CCutsceneMgr10ms_runningE");
+    if (!camProcess || !padLR || !padUD || !g_FindPlayerEntity || !g_FindPlayerVehicle || !g_GetPad || !g_theCamera ||
+        !g_timeStep || !g_CalculateDerivedValues || !g_CopyCameraMatrixToRWCam || !g_cutsceneRunning) {
+        SKY_LOG("tools: freecam/noclip/LOD symbols missing, disabled");
         return;
     }
     if (!aml->Hook(camProcess, (void*)&Hooked_CameraProcess, (void**)&o_CameraProcess) ||
@@ -289,10 +305,22 @@ void ToolsInit() {
     SKY_LOG("tools: installed");
 }
 
+// One-shots (set time, move player to camera) fire only when their ini value changes while the game runs: not at
+// startup (a save would get its clock reset every launch) and not on unrelated reloads.
 void ToolsConfigChanged() {
+    static bool seen = false;
+    static int lastHour, lastMinute;
+    static bool lastMove;
     Pending_Weather();
-    g_setHour.store(cfg.setHour);
-    g_setMinute.store(cfg.setMinute);
+    if (seen && (cfg.setHour != lastHour || cfg.setMinute != lastMinute) && cfg.setHour >= 0) {
+        g_setMinute.store(cfg.setMinute < 0 ? 0 : cfg.setMinute);
+        g_setHour.store(cfg.setHour);
+    }
+    if (seen && cfg.movePlayerToCamera && !lastMove) g_moveToCamReq.store(true);
+    lastHour = cfg.setHour;
+    lastMinute = cfg.setMinute;
+    lastMove = cfg.movePlayerToCamera;
+    seen = true;
     g_freezeTime.store(cfg.freezeTime);
     g_timeSpeed.store(cfg.timeSpeed);
     g_timelapse.store(cfg.timelapse);
@@ -300,9 +328,24 @@ void ToolsConfigChanged() {
     g_noclipOn.store(cfg.noclip);
     g_freecamSpeed.store((float)cfg.freecamSpeed);
     g_noclipSpeed.store((float)cfg.noclipSpeed);
-    if (cfg.movePlayerToCamera) { g_moveToCamReq.store(true); cfg.movePlayerToCamera = false; }
+}
+
+void ToolsStatus() {
+    if (!g_SetGameClock) { SKY_LOG("tools: off"); return; }
+    static const uint8_t* hours = (const uint8_t*)Sym("_ZN6CClock18ms_nGameClockHoursE");
+    static const uint8_t* minutes = (const uint8_t*)Sym("_ZN6CClock20ms_nGameClockMinutesE");
+    const uint8_t* ped = g_FindPlayerEntity ? g_FindPlayerEntity(-1) : nullptr;
+    const float* pm = ped ? *(float* const*)(ped + kOffMatrix) : nullptr;
+    const float* cm = CameraMatrix();
+    const float zero[16] = {};
+    if (!pm) pm = zero;
+    if (!cm) cm = zero;
+    SKY_LOG("tools: clock=%02d:%02d msPerMinute=%u weather=%d/%d forced=%d interp=%.2f freecam=%d noclip=%d player=%p "
+            "ppos=%.1f,%.1f,%.1f cpos=%.1f,%.1f,%.1f",
+            hours ? *hours : -1, minutes ? *minutes : -1, *g_msPerMinute, *g_oldWeather, *g_newWeather, *g_forcedWeather,
+            *g_interp, (int)g_freecamOn.load(), (int)g_noclipOn.load(), ped, pm[12], pm[13], pm[14], cm[12], cm[13], cm[14]);
 }
 
 }  // namespace
 
-static const Registrar kToolsFeature({"tools", ToolsInit, ToolsConfigChanged});
+static const Registrar kToolsFeature({"tools", ToolsInit, ToolsConfigChanged, false, ToolsStatus});

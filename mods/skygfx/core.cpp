@@ -1,6 +1,8 @@
 // SkyGfx Android core: AML entry, SkyGfx.ini, engine symbol and reflection helpers, actor hook fan-out.
 // Feature contract: skygfx.h.
+#include <atomic>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
@@ -52,16 +54,18 @@ const IniKey kKeys[] = {
     KEY("Colours", "NightExposure", 'f', nightExposure),
     KEY("Shadows", "Darkness", 'f', shadowDarkness),
     KEY("Timecyc", "PS2Timecyc", 'b', ps2Timecyc),
+    KEY("Timecyc", "File", 's', timecycFile),
     KEY("Radiosity", "Radiosity", 'b', radiosity),
     KEY("Radiosity", "Intensity", 'i', radiosityIntensity),
+    KEY("Radiosity", "Offset", 'f', radiosityOffset),
     KEY("Radiosity", "DEBloom", 'f', radiosityDeBloom),
     KEY("Grain", "Grain", 'b', grain),
     KEY("Grain", "GrainStrength", 'f', grainStrength),
+    KEY("WaterDrops", "Enabled", 'b', waterDrops),
+    KEY("WaterDrops", "MaxDrops", 'i', maxDrops),
     KEY("SpeedFX", "SpeedFX", 'b', speedFx),
     KEY("SpeedFX", "TestMode", 'b', speedFxTest),
     KEY("StreetLights", "DrawDistanceDm", 'i', streetLightDrawDm),
-    KEY("StreetLights", "ShadowDistanceDm", 'i', streetLightShadowDm),
-    KEY("StreetLights", "OtherLightShadows", 'b', otherLightShadows),
     KEY("StreetLights", "BollardBrightness", 'f', bollardBrightness),
     KEY("StreetLights", "GlobeLampBrightness", 'i', globeLampBrightness),
     KEY("Corona", "Enabled", 'b', corona),
@@ -69,13 +73,6 @@ const IniKey kKeys[] = {
     KEY("Corona", "Intensity", 'f', coronaIntensity),
     KEY("Corona", "FarClipDm", 'i', coronaFarClipDm),
     KEY("World", "LodDistance", 'f', lodDistance),
-    KEY("ModernLook", "SSGI", 'b', ssgi),
-    KEY("ModernLook", "SSGIQuality", 'i', ssgiQuality),
-    KEY("ModernLook", "AmbientOcclusion", 'b', ambientOcclusion),
-    KEY("ModernLook", "Reflections", 'b', reflections),
-    KEY("ModernLook", "ReflectionQuality", 'i', reflectionQuality),
-    KEY("ModernLook", "VolumetricFog", 'b', volumetricFog),
-    KEY("ModernLook", "LensFlare", 'b', lensFlare),
     KEY("ModernLook", "SunStrength", 'f', sunStrength),
     KEY("Debug", "ForceWeather", 'i', forceWeather),
     KEY("Debug", "BlendWeatherB", 'i', blendWeatherB),
@@ -155,8 +152,37 @@ void H_Update(void* self, float dt) {
 }
 
 void (*o_Tick)(void*, float);
+
+// Config reloads run on the game thread only, so features never see cfg change under them. Requests come from
+// ModMenu (GTAML_OnConfigChanged, any thread) and from the ini watch below (an edited file applies live).
+std::atomic<bool> g_reloadRequested{false};
+char g_iniPath[512];
+struct timespec g_iniMtime;
+off_t g_iniSize = -1;
+constexpr int kWatchEveryTicks = 30;    // ~0.5-1 s
+constexpr int kStatusEveryTicks = 150;  // ~3-5 s, Log=2 only
+
+// True when SkyGfx.ini's mtime or size differs from the last load (also records the new stamp).
+bool IniChanged() {
+    struct stat st;
+    if (stat(g_iniPath, &st) != 0) return false;
+    const bool changed = st.st_mtim.tv_sec != g_iniMtime.tv_sec || st.st_mtim.tv_nsec != g_iniMtime.tv_nsec ||
+                         st.st_size != g_iniSize;
+    g_iniMtime = st.st_mtim;
+    g_iniSize = st.st_size;
+    return changed;
+}
+
+void ReloadConfig();
+
 void H_Tick(void* self, float dt) {
     static bool lateDone;
+    static unsigned ticks;
+    if (!g_hasGameThread) {  // before late init: features may test OnGameThread() inside init
+        g_gameThread = pthread_self();
+        __atomic_store_n(&g_hasGameThread, true, __ATOMIC_RELEASE);
+    }
+    g_tod = self;
     if (!lateDone) {  // first game-thread tick: the UObject system is up
         lateDone = true;
         for (const Feature& f : Features()) {
@@ -166,11 +192,11 @@ void H_Tick(void* self, float dt) {
             if (f.configChanged) f.configChanged();
         }
     }
-    g_tod = self;
-    if (!g_hasGameThread) {
-        g_gameThread = pthread_self();
-        __atomic_store_n(&g_hasGameThread, true, __ATOMIC_RELEASE);
-    }
+    ++ticks;
+    if (g_reloadRequested.exchange(false) || (ticks % kWatchEveryTicks == 0 && IniChanged())) ReloadConfig();
+    if (cfg.log >= 2 && ticks % kStatusEveryTicks == 0)
+        for (const Feature& f : Features())
+            if (f.status) f.status();
     FanPre(Point::Tick, self, nullptr, dt, 0);
     o_Tick(self, dt);
     Fan(Point::Tick, self, nullptr, dt, 0);
@@ -205,6 +231,7 @@ void SetValue(Config& out, const IniKey& key, const char* value) {
         case 'b': *reinterpret_cast<bool*>(p) = atoi(value) != 0; break;
         case 'i': *reinterpret_cast<int*>(p) = atoi(value); break;
         case 'f': *reinterpret_cast<float*>(p) = strtof(value, nullptr); break;
+        case 's': snprintf(p, sizeof Config::timecycFile, "%s", value); break;  // the only string key
     }
 }
 
@@ -243,14 +270,38 @@ void ReadIni(const char* path, Config& out) {
     fclose(f);
 }
 
+template <class T> void ClampTo(T& v, T lo, T hi) { v = v < lo ? lo : (v > hi ? hi : v); }
+
+// The ini is user input: values the effects index or blend with are clamped to PC SkyGfxDE's ranges (core.cpp).
+void Validate(Config& c) {
+    ClampTo(c.radiosityIntensity, 0, 255);
+    ClampTo(c.radiosityOffset, 0.0f, 64.0f);
+    ClampTo(c.radiosityDeBloom, 0.0f, 4.0f);
+    ClampTo(c.grainStrength, 0.0f, 10.0f);
+    ClampTo(c.maxDrops, 0, 2000);
+    ClampTo(c.lodDistance, 0.1f, 10.0f);
+    ClampTo(c.sunStrength, 0.0f, 10.0f);
+}
+
 void LoadConfig() {
-    const char* dir = aml->GetConfigPath();
-    const size_t n = strlen(dir);
-    char path[512];
-    snprintf(path, sizeof path, "%s%sSkyGfx.ini", dir, (n && dir[n - 1] == '/') ? "" : "/");
+    if (!g_iniPath[0]) {
+        const char* dir = aml->GetConfigPath();
+        const size_t n = strlen(dir);
+        snprintf(g_iniPath, sizeof g_iniPath, "%s%sSkyGfx.ini", dir, (n && dir[n - 1] == '/') ? "" : "/");
+    }
+    IniChanged();  // stamp the version being read, so the watch only fires on later edits
     Config next;
-    ReadIni(path, next);
+    ReadIni(g_iniPath, next);
+    Validate(next);
     cfg = next;
+}
+
+// Game thread only (see g_reloadRequested).
+void ReloadConfig() {
+    LoadConfig();
+    SKY_INFO("config reloaded");
+    for (const Feature& f : Features())
+        if (f.configChanged) f.configChanged();
 }
 
 }  // namespace
@@ -360,11 +411,9 @@ ON_MOD_LOAD() {
     SKY_LOG("installed %d features", (int)Features().size());
 }
 
+// ModMenu's thread: only flags the reload; the next game-thread Tick performs it (ReloadConfig).
 extern "C" void GTAML_OnConfigChanged() {
-    if (!g_ready) return;
-    LoadConfig();
-    for (const Feature& f : Features())
-        if (f.configChanged) f.configChanged();
+    if (g_ready) g_reloadRequested.store(true);
 }
 
 // ---- Console variables -------------------------------------------------------------

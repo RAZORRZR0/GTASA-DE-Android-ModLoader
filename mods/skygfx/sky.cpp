@@ -1,7 +1,16 @@
 // Classic sky flag scope, classic density cap and GTA height-fog density for the Android UE4.26 build.
-// Ported from SkyGfxDE core.cpp (Hooked_FogUpdateColors, classic flag scope).
+// Ported from SkyGfxDE core.cpp (classic flag scope around the TOD/fog updates, the weather particles, the volumetric
+// clouds and the moving fog; Hooked_FogUpdateColors; the moon/stars weather fade).
+// arm64 v1.87.0: CWeather::AddRain 0x5648910 (the rain spray, called by CWeather::Update; AddSandStormParticles is an
+// empty stub here, so the sandstorm clouds do not exist to re-enable), CClouds::VolumetricCloudsRender 0x560b934 and
+// CClouds::MovingFogRender 0x560ca10 (both test the classic weather data the flag enables). AGTATimeOfDay:
+// CloudyAmount +0x5D4, live MoonColor +0x3F8 / StarsColor +0x408 (reflection), written by ApplyValues (0x4c4202c).
+// shortcut: the rainbow (PC: a classic-scoped DE function) has no native reader of CWeather::Rainbow on Android;
+// upgrade when the function drawing it is found on device.
 #include <math.h>
+#include <mutex>
 #include <stdint.h>
+#include <mod/amlmod.h>
 #include "skygfx.h"
 
 using namespace skygfx;
@@ -14,7 +23,10 @@ const char* const kColoursSym = "_ZN10CTimeCycle16m_CurrentColoursE";
 
 uint8_t* g_classicFlag = nullptr;
 const uint8_t* g_colours = nullptr;   // CTimeCycle::m_CurrentColours (CColourSet layout, device-verified: FarClip 0x50, FogStart 0x54)
-int g_depth = 0;                      // nesting depth of scoped Tick / UpdateColors calls
+// The flag is held at 1 while any scoped function runs (outermost scope across threads: the cloud renderers may run
+// off the game thread), and the game's own value comes back when the last one returns. Pre and post always pair.
+std::mutex g_scopeMu;
+int g_depth = 0;                      // scoped calls in progress, all threads
 bool g_held = false;                  // we set the flag to 1 for the outermost scope
 uint8_t g_saved = 0;                  // game's own flag value, restored when the outermost scope ends
 uint32_t g_offDensity = 0;
@@ -24,15 +36,15 @@ bool g_offOk = false;
 constexpr double kLn2 = 0.693147;
 constexpr double kGtaScale = 0.480453;
 constexpr double kClassicFarMul = 1.8;
+constexpr size_t kCloudyAmount = 0x5D4, kMoonColor = 0x3F8, kStarsColor = 0x408;
 
 float FarClip() { return *reinterpret_cast<const float*>(g_colours + 0x50); }
 float FogStartM() { return *reinterpret_cast<const float*>(g_colours + 0x54); }
 
-// Scoped classic flag: held at 1 for the outermost Tick / UpdateColors call while atmosphereMode==0.
-// Depth counts both kinds of call, so a nested call restores nothing. Pre and post always pair.
 void ScopePre(void*, void*, float, float) {
     if (!g_classicFlag) return;
-    if (g_depth++ == 0 && cfg.atmosphereMode == 0) {
+    std::lock_guard<std::mutex> l(g_scopeMu);
+    if (g_depth++ == 0 && cfg.enabled && cfg.atmosphereMode == 0) {
         g_saved = *g_classicFlag;
         *g_classicFlag = 1;
         g_held = true;
@@ -41,9 +53,29 @@ void ScopePre(void*, void*, float, float) {
 
 void ScopePost(void*, void*, float, float) {
     if (!g_classicFlag) return;
+    std::lock_guard<std::mutex> l(g_scopeMu);
     if (--g_depth == 0 && g_held) {
         *g_classicFlag = g_saved;
         g_held = false;
+    }
+}
+
+// Native void() functions run inside the scope (PC ClassicScope wrappers).
+typedef void (*VoidFn)();
+VoidFn o_AddRain, o_VolumeClouds, o_MovingFog;
+void H_AddRain() { ScopePre(nullptr, nullptr, 0, 0); o_AddRain(); ScopePost(nullptr, nullptr, 0, 0); }
+void H_VolumeClouds() { ScopePre(nullptr, nullptr, 0, 0); o_VolumeClouds(); ScopePost(nullptr, nullptr, 0, 0); }
+void H_MovingFog() { ScopePre(nullptr, nullptr, 0, 0); o_MovingFog(); ScopePost(nullptr, nullptr, 0, 0); }
+
+// PC: moon and R* stars x (1 - max(Foggyness, CloudCoverage)), as the original CClouds::Render; DE has CloudyAmount
+// for that. Applied right after DE writes the live colours (ApplyValues), so it never compounds.
+void OnApplyValues(void* self, void*, float, float) {
+    if (!self || !cfg.enabled || cfg.atmosphereMode != 0 || !OnGameThread()) return;
+    uint8_t* tod = static_cast<uint8_t*>(self);
+    const float clear = 1.0f - fminf(fmaxf(*reinterpret_cast<const float*>(tod + kCloudyAmount), 0.0f), 1.0f);
+    for (size_t off : { kMoonColor, kStarsColor }) {
+        float* c = reinterpret_cast<float*>(tod + off);
+        for (int i = 0; i < 4; ++i) c[i] *= clear;
     }
 }
 
@@ -86,6 +118,16 @@ void Init() {
     ObservePre(Point::FogUpdateColors, ScopePre);
     Observe(Point::FogUpdateColors, ScopePost);
     Observe(Point::FogUpdateColors, OnFogUpdateColors);
+    Observe(Point::ApplyValues, OnApplyValues);
+    const struct { const char* sym; void* fn; VoidFn* orig; } hooks[] = {
+        { "_ZN8CWeather7AddRainEv", (void*)&H_AddRain, &o_AddRain },
+        { "_ZN7CClouds22VolumetricCloudsRenderEv", (void*)&H_VolumeClouds, &o_VolumeClouds },
+        { "_ZN7CClouds15MovingFogRenderEv", (void*)&H_MovingFog, &o_MovingFog },
+    };
+    for (const auto& h : hooks) {
+        void* p = Sym(h.sym);
+        if (!p || !aml->Hook(p, h.fn, (void**)h.orig)) SKY_LOG("sky: hook failed %s", h.sym);
+    }
 }
 
 Registrar reg(Feature{"Sky", Init, nullptr});

@@ -4,14 +4,17 @@
 //  - One feature per .cpp. Register it with a static Registrar. Do not touch static init.
 //  - Do not define MYMOD, NEEDGAME or ON_MOD_LOAD. core.cpp owns them.
 //  - Resolve engine symbols and install hooks only from Feature::init (libUE4 is loaded by then).
-//  - Only UObject access from the game thread (see OnGameThread). configChanged runs on the ModMenu thread, so it must only set state that Tick/Update consume.
-//  - One-shot Debug keys (SetHour, SetMinute, MovePlayerToCamera) are consumed in memory by their feature (reset to -1 or 0). Core never writes SkyGfx.ini.
+//  - Only UObject access from the game thread (see OnGameThread). configChanged runs on the game thread (core defers
+//    ModMenu saves and SkyGfx.ini edits to the next AGTATimeOfDay::Tick), except the one call for early features at load.
+//  - One-shot Debug keys (SetHour, SetMinute, MovePlayerToCamera) fire when their value changes while the game runs,
+//    never at load. Core never writes SkyGfx.ini.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 #include <android/log.h>
 
 // Tag "SkyGfx". SKY_LOG always prints. SKY_INFO and SKY_VERBOSE are gated by [General] Log.
+// Log=2 also prints each feature's status line every ~150 ticks (Feature::status); device tests assert on them.
 #define SKY_LOG(...) __android_log_print(ANDROID_LOG_INFO, "SkyGfx", __VA_ARGS__)
 #define SKY_INFO(...) do { if (skygfx::cfg.log >= 1) SKY_LOG(__VA_ARGS__); } while (0)
 #define SKY_VERBOSE(...) do { if (skygfx::cfg.log >= 2) SKY_LOG(__VA_ARGS__); } while (0)
@@ -19,7 +22,7 @@
 namespace skygfx {
 
 // Settings from SkyGfx.ini. Field names map to [Section] Key in the ini. Defaults are the Android defaults.
-// Core reloads the struct on load and after every ModMenu save. Features read fields directly.
+// Core reloads the struct on load and on the game thread after every ModMenu save or ini edit. Features read fields directly.
 struct Config {
     // [General]
     bool enabled = true;              // Enabled
@@ -28,25 +31,25 @@ struct Config {
     // [ColourFilter]
     bool ps2Filter = true;            // PS2Filter
     float filterStrength = 1.0f;      // Strength
-    float gameTimecycStrength = 0.4f; // GameTimecycStrength
+    float gameTimecycStrength = 0.35f; // GameTimecycStrength
     float keepBrightness = 0.5f;      // KeepBrightness
 
     // [Grade]
-    float saturation = 1.2f;          // Saturation
-    float contrast = 1.0f;            // Contrast
+    float saturation = 1.15f;         // Saturation
+    float contrast = 1.05f;           // Contrast
 
     // [Atmosphere]
     int atmosphereMode = 0;           // Mode: 0 classic sky, 1 GTA fog, 2 modern
     float fogDistance = 1.8f;         // FogDistance
     float fogOpacity = 0.5f;          // FogOpacity
-    float haze = 0.4f;                // Haze
+    float haze = 0.35f;               // Haze
     float groundHaze = 0.0f;          // GroundHaze
 
     // [Colours]
     float skyColour = 1.0f;           // Sky
     float fogColour = 1.0f;           // Fog
-    float ambient = 0.3f;             // Ambient
-    float sunColour = 0.4f;           // Sun
+    float ambient = 0.25f;            // Ambient
+    float sunColour = 0.35f;          // Sun
     float cloudColour = 0.5f;         // Clouds
     float brightness = 1.0f;          // Brightness
     float nightExposure = -0.5f;      // NightExposure
@@ -56,15 +59,21 @@ struct Config {
 
     // [Timecyc]
     bool ps2Timecyc = true;           // PS2Timecyc: 1 PS2 timecyc table, 0 game table
+    char timecycFile[128] = "timecyc_ps2.dat";  // File: in the configs folder (or an absolute path), 8- or 24-hour
 
     // [Radiosity]
     bool radiosity = true;            // Radiosity
-    int radiosityIntensity = 35;      // Intensity
-    float radiosityDeBloom = 0.0f;    // DEBloom
+    int radiosityIntensity = 35;      // Intensity (m_RadiosityIntensity, 0..255)
+    float radiosityOffset = 0.2f;     // Offset: glow offset up-left in PS2 pixels (the PS2's: 6), 0..64
+    float radiosityDeBloom = 0.0f;    // DEBloom: DE's bloom multiplier while radiosity is on (the PS2 had no bloom)
 
     // [Grain]
     bool grain = true;                // Grain
     float grainStrength = 1.0f;       // GrainStrength
+
+    // [WaterDrops]
+    bool waterDrops = true;           // Enabled: skygfx neo water drops on the lens
+    int maxDrops = 2000;              // MaxDrops: most drops on screen at once, 0..2000
 
     // [SpeedFX]
     bool speedFx = true;              // SpeedFX
@@ -72,8 +81,6 @@ struct Config {
 
     // [StreetLights]
     int streetLightDrawDm = 15;       // DrawDistanceDm
-    int streetLightShadowDm = 2;      // ShadowDistanceDm
-    bool otherLightShadows = false;   // OtherLightShadows
     float bollardBrightness = 0.5f;   // BollardBrightness
     int globeLampBrightness = 8;      // GlobeLampBrightness
 
@@ -86,15 +93,8 @@ struct Config {
     // [World]
     float lodDistance = 1.8f;         // LodDistance
 
-    // [ModernLook] (only effective when GMaxRHIFeatureLevel == 3)
-    bool ssgi = false;                // SSGI
-    int ssgiQuality = 4;              // SSGIQuality
-    bool ambientOcclusion = false;    // AmbientOcclusion
-    bool reflections = false;         // Reflections
-    int reflectionQuality = 4;        // ReflectionQuality
-    bool volumetricFog = false;       // VolumetricFog
-    bool lensFlare = true;            // LensFlare
-    float sunStrength = 1.0f;         // SunStrength
+    // [ModernLook] (PC modern.cpp; SSGI/AO/SSR/volumetric fog/lens flare are desktop-renderer only, not on Android)
+    float sunStrength = 1.0f;         // SunStrength: x DE's sun base intensity
 
     // [Debug]
     int forceWeather = -1;            // ForceWeather (-1 off, 0..22)
@@ -163,8 +163,9 @@ float GetCVarFloat(const char* name, float def);
 
 // A feature file registers one of these from a static Registrar.
 // init: once, after symbols resolve and before the core hooks install. Install hooks and observers here.
-// configChanged: after init and after every ModMenu save. Re-apply engine state from cfg here.
-// Either may be null.
+// configChanged: after init and after every config reload (game thread). Re-apply engine state from cfg here.
+// status: Log=2 only, game thread; one SKY_LOG line "<name>: key=value ..." with the feature's live state.
+// Any of them may be null.
 // init runs on the first game-thread AGTATimeOfDay::Tick, when the UObject system is up (StaticClass/StaticStruct
 // are safe), unless early: early features init at mod load, so they may only resolve symbols and install hooks
 // (needed for hooks that must precede the game's own init, e.g. CTimeCycle::Initialise, IPL loading).
@@ -173,6 +174,7 @@ struct Feature {
     void (*init)();
     void (*configChanged)();
     bool early = false;
+    void (*status)() = nullptr;
 };
 struct Registrar {
     explicit Registrar(const Feature& feature);
@@ -185,5 +187,5 @@ namespace skygfx {
 bool TimecycApplied();
 }  // namespace skygfx
 
-// Called by ModMenu after it saves SkyGfx.ini (dlsym). Re-reads cfg and calls every feature's configChanged.
+// Called by ModMenu after it saves SkyGfx.ini (dlsym, any thread). Core reloads on the next game-thread Tick.
 extern "C" void GTAML_OnConfigChanged();

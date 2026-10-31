@@ -103,7 +103,8 @@ void Store(int c, int e, float v) {
     }
 }
 
-// Parses the PS2 file: whitespace-separated numbers, 8 or 24 hour lines per weather, 23 weathers each.
+// Parses the PS2 file: whitespace-separated numbers, weather-major (23 weathers, each 8 or 24 hour lines in clock
+// order), as PC SkyGfxDE reads it. The game's tables are hour-major (entry h * 23 + w).
 // Returns false on any missing or malformed data (table left unchanged).
 bool LoadFile(const char* path) {
     FILE* f = fopen(path, "r");
@@ -128,16 +129,18 @@ bool LoadFile(const char* path) {
     const bool is8 = lines.size() == (size_t)(kHours * kWeathers);
     if (!is24 && !is8) { SKY_LOG("timecyc: %s has %zu lines, expected %d or %d", path, lines.size(), kHours * kWeathers, 24 * kWeathers); return false; }
 
-    for (int w = 0; w < kWeathers; ++w) {
-        for (int h = 0; h < kHours; ++h) {
-            const int line = is24 ? kSlotHours[h] * kWeathers + w : h * kWeathers + w;
-            const std::vector<float>& r = lines[line];
-            if ((int)r.size() < kColumns) { SKY_LOG("timecyc: line %d short (%zu values)", line, r.size()); return false; }
-            for (int c = 0; c < kColumns; ++c) {
-                if (kCols[c].sym) Store(c, h * kWeathers + w, r[c]);
+    const int perWeather = is24 ? 24 : kHours;
+    auto lineOf = [&](int w, int h) { return w * perWeather + (is24 ? kSlotHours[h] : h); };
+    for (int w = 0; w < kWeathers; ++w)
+        for (int h = 0; h < kHours; ++h)
+            if ((int)lines[lineOf(w, h)].size() < kColumns) {
+                SKY_LOG("timecyc: line %d short (%zu values)", lineOf(w, h), lines[lineOf(w, h)].size());
+                return false;
             }
-        }
-    }
+    for (int w = 0; w < kWeathers; ++w)
+        for (int h = 0; h < kHours; ++h)
+            for (int c = 0; c < kColumns; ++c)
+                if (kCols[c].sym) Store(c, h * kWeathers + w, lines[lineOf(w, h)][c]);
     return true;
 }
 
@@ -145,8 +148,9 @@ void Apply(int want) {
     if (!g_ready) return;
     if (want == 1) {
         if (!g_snapped) return;
-        char path[512];
-        snprintf(path, sizeof path, "%s/timecyc_ps2.dat", aml->GetConfigPath());
+        char path[512];  // [Timecyc] File: relative to the configs folder unless absolute (PC: next to the .asi)
+        if (cfg.timecycFile[0] == '/') snprintf(path, sizeof path, "%s", cfg.timecycFile);
+        else snprintf(path, sizeof path, "%s/%s", aml->GetConfigPath(), cfg.timecycFile);
         if (!LoadFile(path)) return;
         g_applied = true;
         SKY_LOG("timecyc: %s applied", path);
