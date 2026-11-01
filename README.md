@@ -8,7 +8,8 @@ This repo contains:
 - `loader/`: builds AML (Android Mod Loader, a submodule) for arm64 and injects
   it into the APK (`patch_apk_aml.sh`).
 - `mods/`: mods built against AML. `hello` is a test mod. `propfix` is a port
-  of GTA_Prop_Fix (PC) to Android.
+  of GTA_Prop_Fix (PC) to Android. `projectpropsde` is a port of ProjectPropsDE
+  (Project Props 4 map props, see `mods/projectpropsde/README.md`).
 - `sdk/`: `gtade.h` (SEH-free safe-read helpers) and `test_host.cpp`.
 - `docs/`: research notes, settings table, build notes.
 
