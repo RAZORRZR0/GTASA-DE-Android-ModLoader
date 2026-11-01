@@ -22,8 +22,12 @@ python3 build_props.py <Project-Props clone> <pakchunk0-Android_ASTC.pak>
 The pak is inside the game's `base.apk`: `assets/main.obb.png` is a zip holding
 `Gameface/Content/Paks/pakchunk0-Android_ASTC.pak` (not encrypted). Needs
 [repak](https://github.com/trumank/repak). Writes `ProjectPropsDE.dat` and `manifest.txt` (both git-ignored: the
-placements belong to the Project Props authors). Same selection as the PC `build.py`: 16,161 placements in 20 DE IPLs
-(PC: 16,166; five placements use model ids Android's IDEs don't have).
+placements belong to the Project Props authors). Same selection and fixes as the PC `build.py` (models 647 and 736
+lowered to the ground): 16,166 placements in 20 DE IPLs, as on PC.
+
+It also writes `ProjectPropsDE.stock` (committed): just the game facts the build needs, the IDE model ids and each
+host IPL's next free instance index. The Morphe "Project Props" patch uses it to build the same `.dat` on the phone
+while patching, downloading the Project Props IPLs from upstream; with Morphe nothing here needs to be copied by hand.
 
 ## Install
 

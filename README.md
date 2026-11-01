@@ -18,8 +18,8 @@ This repo contains:
 ```sh
 git submodule update --init --recursive
 loader/build_aml_arm64.sh       # applies the two arm64 patches, builds libAML.so
-mods/build.sh                   # builds mods/hello and mods/propfix
-loader/patch_apk_aml.sh <base.apk> loader/aml/libs/arm64-v8a/libAML.so <out.apk>
+mods/build.sh                   # builds every mod
+loader/patch_apk_aml.sh <base.apk> loader/aml/libs/arm64-v8a/libAML.so <out.apk>  # PC install only
 ```
 
 The NDK path defaults to `~/Library/Android/sdk/ndk/27.3.13750724`. Override
@@ -30,14 +30,19 @@ keystore is git-ignored and is never committed.
 
 ## Install
 
+On the phone, with [Morphe](https://morphe.software): add the patch source
+`https://github.com/RAZORRZR0/gtasa-de-morphe-patches` in Morphe Manager, select
+GTA: SA 1.87.0 and the mods, patch and install. The patches bundle AML and the
+mods built here (their repo's `sync-mods.sh` copies them).
+
+From a PC instead:
+
 1. Back up your saves, uninstall the original (this wipes its data), then
    install the patched APK (`loader/patch_apk_aml.sh`).
-2. Copy `mods/propfix/libs/arm64-v8a/libpropfix.so` (built by `mods/build.sh`)
-   to `Android/data/com.rockstargames.gtasa.de/mods/`.
-3. Copy `mods/propfix/GTA_Prop_Fix.ini` to
-   `Android/data/com.rockstargames.gtasa.de/configs/` (verified on device:
-   logcat `GTAPropFix: ini .../configs/GTA_Prop_Fix.ini (found)`).
-   The defaults are in `docs/settings-defaults.md`.
+2. Copy each mod's `libs/arm64-v8a/lib<mod>.so` to
+   `Android/data/com.rockstargames.gtasa.de/mods/` and its `.ini`/data files to
+   `Android/data/com.rockstargames.gtasa.de/configs/`. The defaults are in
+   `docs/settings-defaults.md`.
 
 ## Credits and licenses
 
