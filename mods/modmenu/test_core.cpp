@@ -24,8 +24,8 @@ static int g_pass = 0, g_fail = 0;
         }                                                                        \
     } while (0)
 
-static const char* kPropfixIni = "/tmp/gtamod/repo/mods/propfix/GTA_Prop_Fix.ini";
-static const char* kShippedLinks = "/tmp/gtamod/repo/mods/modmenu/configs/modmenu.ini";
+static const char* kPropfixIni = "../propfix/GTA_Prop_Fix.ini";  // run from mods/modmenu
+static const char* kShippedLinks = "configs/modmenu.ini";
 
 static std::string MakeTempDir() {
     char tmpl[] = "/tmp/modmenu_test.XXXXXX";
@@ -216,6 +216,29 @@ int main(int argc, char** argv) {
     CHECK(StepNumber("1.5", ValueKind::Float, -1) == "1.4");
     CHECK(StepNumber("0.05", ValueKind::Float, -1) == "0.00");
     CHECK(StepNumber("abc", ValueKind::Float, 1) == "abc");
+    // Labels, titles and slider ranges.
+    CHECK(Humanize("GameTimecycStrength") == "Game Timecyc Strength");
+    CHECK(Humanize("PS2Filter") == "PS2 Filter");
+    CHECK(Humanize("DEBloom") == "DE Bloom");
+    CHECK(Humanize("SSGIQuality") == "SSGI Quality");
+    CHECK(Humanize("ColourFilter") == "Colour Filter");
+    CHECK(Humanize("GTA_Prop_Fix") == "GTA Prop Fix");
+    CHECK(Humanize("Log") == "Log");
+    CHECK(ModTitle("propfix", "GTA_Prop_Fix.ini") == "GTA Prop Fix");
+    CHECK(ModTitle("skygfx", "SkyGfx.ini") == "SkyGfx");
+    CHECK(ModTitle("hello", "") == "hello");
+    double lo = 0, hi = 0;
+    CHECK(ParseRange("Strength of the sun.\nRange: 0..10", lo, hi) && lo == 0 && hi == 10);
+    CHECK(ParseRange("range: -0.5..2.5 (soft)", lo, hi) && lo == -0.5 && hi == 2.5);
+    CHECK(!ParseRange("no range here", lo, hi));
+    CHECK(!ParseRange("range: 3..1", lo, hi));
+    CHECK(!ParseRange("range: 1-3", lo, hi));
+    CHECK(FormatNumber(1.5, ValueKind::Float) == "1.5");
+    CHECK(FormatNumber(1.0, ValueKind::Float) == "1.0");
+    CHECK(FormatNumber(0.333, ValueKind::Float) == "0.33");
+    CHECK(FormatNumber(-0.001, ValueKind::Float) == "0.0");
+    CHECK(FormatNumber(14.6, ValueKind::Int) == "15");
+    CHECK(FormatNumber(-2.5, ValueKind::Int) == "-3");
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

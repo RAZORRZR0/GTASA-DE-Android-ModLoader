@@ -55,11 +55,11 @@ static Malloc_Fn g_malloc;
 static Realloc_Fn g_realloc;
 
 enum NameId { N_SetTemplate, N_InteractedButton, N_Construct, N_Destruct, N_FinalCheck, N_Tick, N_OnSlotClicked,
-              N_UpdateSettings, N_NextSel, N_PrevSel, N_InteractedSel, N_COUNT };
+              N_UpdateSettings, N_NextSel, N_PrevSel, N_InteractedSel, N_TabUsed, N_COUNT };
 static const char* const kNames[N_COUNT] = {"SetTemplate", "InteractedButton", "Construct", "Destruct",
                                             "On Option Changed Final Check", "Tick", "OnSlotClicked",
                                             "UpdateSettings", "NextSelection", "PreviousSelection",
-                                            "InteractedWithSelectionSlot"};
+                                            "InteractedWithSelectionSlot", "TabUsed"};
 static FNameRaw g_name[N_COUNT];
 
 static const char kModsLabel[] = "mods";
@@ -225,14 +225,17 @@ static bool g_needBuild;          // (re)fill the list on the next Tick
 static bool g_creating;           // we are adding rows: their Construct is ours
 static bool g_tabsDone;           // sub-tab headers relabelled/hidden
 static int g_view = -1;           // -1 = mod list, else ModList index of the open mod page
+static int g_tabSel = 0;          // selected sub-tab: 0 = mod list, k = mod k-1 (the first kModTabs mods)
+static int32_t g_pendingTab = -1;  // TabUsed's selected tab, applied after the game ran it (AfterCall)
+constexpr int kModTabs = 4;       // the copied Options tab has 5 sub-tab buttons: "mods" + 4 mods
 static std::vector<void*> g_origRows;  // the game's own rows in g_list (prototypes for our rows)
 
 static std::string g_modsDir, g_cfgDir;
 static modmenu::ModList g_mods;
 static std::vector<modmenu::IniDoc> g_docs;  // ini of the open mod page (0 or 1 entries)
 
-enum class RowKind { Selection, Message };
-enum class Act { None, OpenMod, ToggleMod, IniKey, Back };
+enum class RowKind { Selection, Message, Slider };
+enum class Act { None, OpenMod, ToggleMod, IniKey };
 struct Row {
     void* obj;
     RowKind kind;
@@ -241,6 +244,8 @@ struct Row {
     std::string key;    // ini key id (IniKey)
     std::string label, value;
     bool dirty;         // texts are applied on the next Tick, after the game's own init has run
+    float num;          // Slider: shown value (saved to the ini when a drag ends or the number is typed)
+    float lo, hi, step; // Slider: range applied to MainSlider
 };
 static std::vector<Row> g_rows;
 
@@ -320,13 +325,23 @@ static int32_t ParmOffset(void* fn, const char* name) {
 
 // ---- Values ------------------------------------------------------------------------
 static std::string KeyValueText(const modmenu::IniKey& k) {
-    if (k.kind == modmenu::ValueKind::Bool) return k.value == "1" ? "ON" : "OFF";
+    if (k.kind == modmenu::ValueKind::Bool) return k.value == "1" ? "On" : "Off";
     if (k.kind == modmenu::ValueKind::Choice)
         for (const modmenu::Label& l : k.labels) if (std::to_string(l.value) == k.value) return l.text;
     return k.value;
 }
 
-static std::string ModState(size_t i) { return g_mods.At(i).enabled ? "ON" : "OFF"; }
+static std::string ModState(size_t i) { return g_mods.At(i).enabled ? "On" : "Off"; }
+
+// The mod's ini file name ("" if none): modmenu.ini [Links] first, else a normalized-name match.
+static std::string IniFor(size_t m) {
+    modmenu::IniDoc cfg;
+    std::map<std::string, std::string> links;
+    if (cfg.Load(g_cfgDir + "/modmenu.ini")) links = modmenu::ParseLinks(cfg);
+    return modmenu::FindIni(g_mods.At(m).name, modmenu::ListConfigs(g_cfgDir), links);
+}
+
+static std::string ModTitle(size_t m) { return modmenu::ModTitle(g_mods.At(m).name, IniFor(m)); }
 
 // Live settings: a loaded mod may export `extern "C" void GTAML_OnConfigChanged()`; we call it after saving its ini.
 typedef void (*ConfigChanged_Fn)();
@@ -365,6 +380,19 @@ static void StepKey(const std::string& id, int dir, size_t mod) {
     if (ConfigChanged_Fn fn = LiveHook(mod)) fn();
 }
 
+// Writes a slider value (clamped to its range, formatted for the key's kind), saves, notifies the mod.
+static void SaveNumber(const std::string& id, double v, size_t mod) {
+    if (g_docs.empty()) return;
+    modmenu::IniDoc& doc = g_docs[0];
+    const modmenu::IniKey* k = doc.Find(id);
+    double lo, hi;
+    if (!k || !modmenu::ParseRange(k->description, lo, hi)) return;
+    const std::string next = modmenu::FormatNumber(std::min(hi, std::max(lo, v)), k->kind);
+    if (next == k->value) return;
+    if (!doc.Set(id, next) || !doc.Save()) { LOG("could not save %s", id.c_str()); return; }
+    if (ConfigChanged_Fn fn = LiveHook(mod)) fn();
+}
+
 // ---- Building rows -------------------------------------------------------------------
 struct Proto { void* cls; uint8_t* options; };  // a live row of that kind; options points into it
 
@@ -379,9 +407,13 @@ static bool TakeProto(void* row, Proto& p) {
 static void* (*g_wblCreate)(void* worldCtx, void* cls, void* owningPlayer);  // UWidgetBlueprintLibrary::Create
 static FNameRaw g_dummyName;
 
+struct SliderSpec { float lo, hi, step, value; };
+
 // Creates a row of proto's class and adds it with a copy of proto's Options whose PropertyName is the dummy.
+// Slider rows also get UseSlider/UseText (the game's number box) and their range in Options, which the row's
+// InitSlotButton applies to its MainSlider.
 static void AddRow(const Proto& proto, RowKind kind, Act act, size_t mod, const std::string& key,
-                   const std::string& label, const std::string& value) {
+                   const std::string& label, const std::string& value, const SliderSpec* slider = nullptr) {
     void* addFn = FindFn(g_list, "AddSlotItem");
     if (!addFn || !g_wblCreate) return;
     const int32_t oItem = ParmOffset(addFn, "Slot Item"), oOpts = ParmOffset(addFn, "Options");
@@ -401,17 +433,29 @@ static void AddRow(const Proto& proto, RowKind kind, Act act, size_t mod, const 
         LOG("AddSlotItem layout unexpected (%d %d %d %d)", oItem, oOpts, oName, size);
         return;
     }
-    g_creating = true;
-    void* row = g_wblCreate(g_list, proto.cls, nullptr);
-    if (!row) { g_creating = false; LOG("create row failed"); return; }
     alignas(16) uint8_t parms[1024] = {};
-    memcpy(parms + oItem, &row, 8);
     // Shallow copy of a live row's Options; the callee deep-copies it into the new row (Slot.Options = Options).
     memcpy(parms + oOpts, proto.options, 0x90);
     memcpy(parms + oOpts + oName, &g_dummyName, sizeof g_dummyName);
+    if (slider) {
+        const int32_t oUse = ParmOffset(structObj, "UseSlider"), oText = ParmOffset(structObj, "UseText"),
+                      oMin = ParmOffset(structObj, "MinSlider"), oMax = ParmOffset(structObj, "MaxSlider"),
+                      oStep = ParmOffset(structObj, "StepSizeOverride");
+        if (oUse < 0 || oText < 0 || oMin < 0 || oMax < 0 || oStep < 0) { LOG("slider Options fields missing"); return; }
+        parms[oOpts + oUse] = 1;
+        parms[oOpts + oText] = 1;
+        memcpy(parms + oOpts + oMin, &slider->lo, 4);
+        memcpy(parms + oOpts + oMax, &slider->hi, 4);
+        memcpy(parms + oOpts + oStep, &slider->step, 4);
+    }
+    g_creating = true;
+    void* row = g_wblCreate(g_list, proto.cls, nullptr);
+    if (!row) { g_creating = false; LOG("create row failed"); return; }
+    memcpy(parms + oItem, &row, 8);
     o_ProcessEvent(g_list, addFn, parms);  // SettingsObject stays null
     g_creating = false;
-    g_rows.push_back(Row{row, kind, act, mod, key, label, value, true});
+    const SliderSpec s = slider ? *slider : SliderSpec{0, 0, 0, 0};
+    g_rows.push_back(Row{row, kind, act, mod, key, label, value, true, s.value, s.lo, s.hi, s.step});
 }
 
 static void Render(Row& r) {
@@ -421,21 +465,36 @@ static void Render(Row& r) {
         return;
     }
     SetTextProp(r.obj, "OptionNameText", r.label);
+    if (r.kind == RowKind::Slider) {  // display only: UpdateSlider/UpdateText do not write settings
+        if (void* ms = PtrProp(r.obj, "MainSlider")) {  // Options.Min/MaxSlider did not reach it (seen: 0..1)
+            CallFn(ms, "SetMinValue", &r.lo, sizeof r.lo);
+            CallFn(ms, "SetMaxValue", &r.hi, sizeof r.hi);
+            CallFn(ms, "SetStepSize", &r.step, sizeof r.step);
+        }
+        CallFn(r.obj, "UpdateSlider", &r.num, sizeof r.num);
+        CallFn(r.obj, "UpdateText", &r.num, sizeof r.num);
+        return;
+    }
     SetTextProp(r.obj, "SelectionText", r.value);
 }
 
 // Clears the list and fills it with the current view: the mod list, or one mod's page.
 static void Build() {
+    // The slider class is remembered from the game's own rows (the first build replaces them); its Options come from
+    // a live selection row (same FGTAOptionsItemTemplate struct), so no pointer into a dead row is ever copied.
+    static void* sliderCls;
     Proto sel = {}, msg = {};
     auto consider = [&](void* row) {
         char cn[128];
         NameStr(ClassOf(row), cn, sizeof cn);
         if (!sel.cls && (strstr(cn, "_Selection_") || strstr(cn, "_Bool_"))) TakeProto(row, sel);
         if (!msg.cls && strstr(cn, "_Message_")) TakeProto(row, msg);
+        if (!sliderCls && strstr(cn, "_Slider_")) sliderCls = ClassOf(row);
     };
     for (Row& r : g_rows) consider(r.obj);
     for (void* r : g_origRows) consider(r);
     if (!sel.cls || !msg.cls) { LOG("no row prototypes yet"); return; }
+    const Proto sld = {sliderCls, sel.options};
 
     CallFn(g_list, "ClearSlotList", nullptr, 0);
     std::vector<Row> old;
@@ -445,70 +504,104 @@ static void Build() {
     g_mods.Scan(g_modsDir);
     if (g_view >= (int)g_mods.Count()) g_view = -1;
     if (g_view < 0) {
-        char head[96];
-        snprintf(head, sizeof head, "%zu mod%s installed", g_mods.Count(), g_mods.Count() == 1 ? "" : "s");
-        AddRow(msg, RowKind::Message, Act::None, 0, "", head, "changes apply after restart");
         for (size_t i = 0; i < g_mods.Count(); ++i)
-            AddRow(sel, RowKind::Selection, Act::OpenMod, i, "", g_mods.At(i).name, ModState(i) + "  >");
+            AddRow(sel, RowKind::Selection, Act::OpenMod, i, "", ModTitle(i), ModState(i));
+        AddRow(msg, RowKind::Message, Act::None, 0, "", "Turning a mod on or off applies after a restart", "");
     } else {
         const size_t m = (size_t)g_view;
-        AddRow(msg, RowKind::Message, Act::Back, 0, "", "<  back",
-               g_mods.At(m).name + (LiveHook(m) ? "  -  changes apply live" : "  -  changes apply after restart"));
-        AddRow(sel, RowKind::Selection, Act::ToggleMod, m, "", "enabled", ModState(m));
+        AddRow(sel, RowKind::Selection, Act::ToggleMod, m, "", "Load at Game Start", ModState(m));
         g_docs.clear();
-        modmenu::IniDoc cfg;
-        std::map<std::string, std::string> links;
-        if (cfg.Load(g_cfgDir + "/modmenu.ini")) links = modmenu::ParseLinks(cfg);
-        const std::string ini = modmenu::FindIni(g_mods.At(m).name, modmenu::ListConfigs(g_cfgDir), links);
+        const std::string ini = IniFor(m);
         if (!ini.empty()) {
             g_docs.emplace_back();
             if (!g_docs[0].Load(g_cfgDir + "/" + ini)) { LOG("could not read %s", ini.c_str()); g_docs.clear(); }
         }
-        if (g_docs.empty()) AddRow(msg, RowKind::Message, Act::None, 0, "", "no settings file", "");
-        else
+        if (g_docs.empty()) {
+            AddRow(msg, RowKind::Message, Act::None, 0, "", "No settings file", "");
+        } else {
+            if (!LiveHook(m)) AddRow(msg, RowKind::Message, Act::None, 0, "", "Settings apply after a restart", "");
+            std::string section = "\x01";
             for (const modmenu::IniKey& k : g_docs[0].Keys()) {
-                const bool editable = k.kind == modmenu::ValueKind::Bool || k.kind == modmenu::ValueKind::Int ||
-                                      k.kind == modmenu::ValueKind::Float ||
-                                      (k.kind == modmenu::ValueKind::Choice && !k.labels.empty());
-                if (editable) AddRow(sel, RowKind::Selection, Act::IniKey, m, k.id, k.id, KeyValueText(k));
-                else AddRow(msg, RowKind::Message, Act::None, m, k.id, k.id, k.value);
+                if (k.section != section) {
+                    section = k.section;
+                    if (!section.empty()) AddRow(msg, RowKind::Message, Act::None, m, "", modmenu::Humanize(section), "");
+                }
+                const std::string label = modmenu::Humanize(k.key);
+                double lo, hi;
+                const bool number = k.kind == modmenu::ValueKind::Int || k.kind == modmenu::ValueKind::Float;
+                if (number && sld.cls && modmenu::ParseRange(k.description, lo, hi)) {
+                    const bool isInt = k.kind == modmenu::ValueKind::Int;
+                    const float v = (float)std::min(hi, std::max(lo, strtod(k.value.c_str(), nullptr)));
+                    const SliderSpec s{(float)lo, (float)hi, isInt ? 1.0f : (float)(hi - lo) / 100.0f, v};
+                    AddRow(sld, RowKind::Slider, Act::IniKey, m, k.id, label, k.value, &s);
+                } else if (number || k.kind == modmenu::ValueKind::Bool ||
+                           (k.kind == modmenu::ValueKind::Choice && !k.labels.empty())) {
+                    AddRow(sel, RowKind::Selection, Act::IniKey, m, k.id, label, KeyValueText(k));
+                } else {
+                    AddRow(msg, RowKind::Message, Act::None, m, k.id, label, k.value);  // strings: read-only
+                }
             }
+        }
     }
     LOG("view %d: %zu rows", g_view, g_rows.size());
 }
 
-// Sub-tab headers: rename the first ("mods (N)"), hide the rest. Children of UI_TabbedLayout_C.TabButtons
-// are UI_Button_Base_C labelled via SetButtonTextValue(Text, JustRebuild=false).
+// Sub-tab headers: "mods", then the first kModTabs mods by title; unused buttons hidden. Children of
+// UI_TabbedLayout_C.TabButtons are UI_Button_Base_C labelled via SetButtonTextValue(Text, JustRebuild=false).
 static void FixTabs() {
     void* box = PtrProp(g_tab, "TabButtons");
     uint8_t* sp = box ? FindProp(box, "Slots") : nullptr;
     int32_t off = 0;
     TArrayRaw slots = {};
     if (!sp || !Rd(sp + UE::Prop_Offset, off) || !Rd((uint8_t*)box + off, slots) || slots.num < 1) return;
+    g_mods.Scan(g_modsDir);
     for (int i = 0; i < slots.num && i < 16; ++i) {
         void* slot = nullptr;
         void* btn = Rd(slots.data + i * 8, slot) ? PtrProp(slot, "Content") : nullptr;
         if (!btn) return;
-        if (i == 0) {
-            char t[32];
-            snprintf(t, sizeof t, "mods (%zu)", g_mods.Count());
-            struct { FTextRaw text; bool justRebuild; } args = {ToText(t), false};
+        const bool used = i == 0 || (i <= kModTabs && (size_t)(i - 1) < g_mods.Count());
+        if (used) {
+            struct { FTextRaw text; bool justRebuild; } args = {ToText(i == 0 ? "mods" : ModTitle((size_t)(i - 1))), false};
             CallFn(btn, "SetButtonTextValue", &args, sizeof args);
-        } else {
-            SetVisible(btn, false);
         }
+        SetVisible(btn, used);
     }
     g_tabsDone = true;
 }
 
+// After the game switched sub-tabs (TabUsed): keep our list in front, since the other lists are the game's real
+// settings, and show the tapped tab's view. The game moves the tab highlight itself.
+static void OnTabUsed(int32_t tab) {
+    void* sel = PtrProp(g_tab, "WidgetSelector");
+    uint8_t* p = sel ? FindProp(sel, "ActiveWidgetIndex") : nullptr;
+    int32_t off = 0, active = 0;
+    if (p && Rd(p + UE::Prop_Offset, off) && Rd((uint8_t*)sel + off, active) && active != 0) {
+        const int32_t zero = 0;
+        CallFn(sel, "SetActiveWidgetIndex", &zero, sizeof zero);
+    }
+    if (tab == g_tabSel || tab < 0 || tab > kModTabs) return;
+    g_tabSel = tab;
+    g_view = tab == 0 || (size_t)(tab - 1) >= g_mods.Count() ? -1 : tab - 1;
+    g_needBuild = true;
+}
+
 static void Activate(Row& r, int dir) {  // dir: +1 next / -1 previous / 0 body tap
+    if (r.kind == RowKind::Slider) return;  // sliders change by dragging or typing (OnSliderEvent)
     switch (r.act) {
     case Act::OpenMod:
-        if (dir == 0) { g_view = (int)r.mod; g_needBuild = true; return; }
+        if (dir == 0) {
+            g_view = (int)r.mod;
+            g_needBuild = true;
+            if (r.mod < (size_t)kModTabs) {  // move the highlight to the mod's tab; TabUsed lands in OnTabUsed
+                const int32_t tab = (int32_t)r.mod + 1;
+                CallFn(g_tab, "SetToTab", &tab, sizeof tab);
+            }
+            return;
+        }
         /* fallthrough: arrows toggle the mod from the list */
     case Act::ToggleMod:
         if (!g_mods.SetEnabled(r.mod, !g_mods.At(r.mod).enabled)) LOG("could not toggle %s", g_mods.At(r.mod).name.c_str());
-        r.value = ModState(r.mod) + (r.act == Act::OpenMod ? "  >" : "");
+        r.value = ModState(r.mod);
         LOG("mod %s -> %s", g_mods.At(r.mod).name.c_str(), ModState(r.mod).c_str());
         break;
     case Act::IniKey:
@@ -516,14 +609,31 @@ static void Activate(Row& r, int dir) {  // dir: +1 next / -1 previous / 0 body 
         if (const modmenu::IniKey* k = g_docs.empty() ? nullptr : g_docs[0].Find(r.key)) r.value = KeyValueText(*k);
         LOG("%s -> %s", r.key.c_str(), r.value.c_str());
         break;
-    case Act::Back:
-        g_view = -1;
-        g_needBuild = true;
-        return;
     case Act::None:
         return;
     }
     r.dirty = true;
+}
+
+// Slider row events (docs/mods_menu_rows2.md section 4). Returns 1 to swallow, 0 to let the game run it, -1 if not one.
+// Dragging moves the UMG slider natively; we mirror the value into the number box (display only on mobile: tapping
+// it opens no keyboard) and save when the drag ends.
+static int OnSliderEvent(Row& r, void* func, void* parms) {
+    char n[160];
+    NameStr(func, n, sizeof n);
+    if (strncmp(n, "BndEvt__", 8) != 0) return -1;
+    if (strstr(n, "OnFloatValueChangedEvent")) {
+        float v = 0;
+        if (parms) Rd(parms, v);
+        r.num = v;
+        CallFn(r.obj, "UpdateText", &r.num, sizeof r.num);
+        return 1;
+    }
+    if (strstr(n, "OnMouseCaptureEndEvent")) {
+        SaveNumber(r.key, r.num, r.mod);
+        return 0;  // the slider's own capture state must end
+    }
+    return -1;
 }
 
 static void StopCapture() {
@@ -532,9 +642,13 @@ static void StopCapture() {
     g_origRows.clear();
     g_docs.clear();
     g_needBuild = false;
+    g_tabSel = 0;
+    g_pendingTab = -1;
 }
 
-// Write detector: logs any settings write while our screen exists (should never happen).
+// Write detector: logs any settings write while our screen exists (should never happen). The slider's drag end
+// writes its value under our dummy name from inside Blueprint code (unhookable); UGameterSettings ignores unknown
+// names, so those writes are expected and not logged.
 typedef void (*SetInt_Fn)(void*, FNameRaw, int32_t);
 typedef void (*SetBool_Fn)(void*, FNameRaw, bool);
 typedef void (*SetFloat_Fn)(void*, FNameRaw, float);
@@ -542,7 +656,7 @@ static SetInt_Fn o_SetInt;
 static SetBool_Fn o_SetBool;
 static SetFloat_Fn o_SetFloat;
 static void LogWrite(const char* what, FNameRaw n) {
-    if (!g_tab) return;
+    if (!g_tab || (n.Index == g_dummyName.Index && n.Number == g_dummyName.Number)) return;
     char buf[1024];
     g_FNamePlain(&n, &buf);
     LOG("GameterSettings::%s(%s) while mods screen open", what, buf);
@@ -578,7 +692,7 @@ static bool Observe(void* obj, void* func, void* parms) {
         int32_t v[2] = {0, 0};  // type (0 = click), index
         if (parms) Rd(parms, v);
         const int32_t want = MenuModsIndex(obj);
-        if (v[0] == 0 && want >= 0 && v[1] == want) { g_view = -1; g_needBuild = g_tab != nullptr; }
+        if (v[0] == 0 && want >= 0 && v[1] == want) { g_view = -1; g_tabSel = 0; g_needBuild = g_tab != nullptr; }
         return false;
     }
     // Our tab is the 2nd options-tab instance built after a patched SetTemplate (index order: options < mods).
@@ -590,12 +704,23 @@ static bool Observe(void* obj, void* func, void* parms) {
         return false;
     }
     if (!g_tab) return false;
+    // TabUsed(button index @0, selected tab @4) fires once per tab button on every tap (seen on device).
+    if (obj == g_tab && Is(fn, N_TabUsed)) {
+        int32_t p[2] = {0, -1};
+        if (parms) Rd(parms, p);
+        g_pendingTab = p[1];
+        return false;
+    }
     if (Is(fn, N_Destruct) && obj == g_tab) { StopCapture(); return false; }
     if (Row* r = FindRow(obj)) {
         if (Is(fn, N_Destruct)) { g_rows.erase(g_rows.begin() + (r - g_rows.data())); return false; }
         if (Is(fn, N_FinalCheck) || Is(fn, N_UpdateSettings) || Is(fn, N_NextSel) || Is(fn, N_PrevSel) ||
             Is(fn, N_InteractedSel))
             return true;
+        if (r->kind == RowKind::Slider) {
+            const int s = OnSliderEvent(*r, func, parms);
+            if (s >= 0) return s == 1;
+        }
         // Body tap: SlotButton.OnClicked is bound to OnSlotClicked (docs/bp_decompiled.md).
         const int dir = Is(fn, N_OnSlotClicked) ? 0 : ClickDir(func);
         if (dir == 2) return false;
@@ -617,6 +742,11 @@ static bool Observe(void* obj, void* func, void* parms) {
 static void AfterCall(void* obj, void* func) {
     int32_t fn = 0;
     if (!Rd((uint8_t*)func + UE::Obj_Name, fn)) return;
+    if (obj == g_tab && Is(fn, N_TabUsed) && g_pendingTab >= 0) {
+        OnTabUsed(g_pendingTab);
+        g_pendingTab = -1;
+        return;
+    }
     if (Is(fn, N_Construct)) {
         char cn[128];
         NameStr(ClassOf(obj), cn, sizeof cn);

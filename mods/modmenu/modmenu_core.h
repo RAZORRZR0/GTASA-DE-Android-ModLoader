@@ -94,4 +94,16 @@ std::vector<std::string> UnlinkedInis(const std::vector<std::string>& iniFiles,
                                       const std::vector<std::string>& modNames,
                                       const std::map<std::string, std::string>& links);
 
+// ---- Display -----------------------------------------------------------------
+// Ini name as a label: words split at case changes and underscores, acronyms kept together.
+// "GameTimecycStrength" -> "Game Timecyc Strength", "PS2Filter" -> "PS2 Filter", "DEBloom" -> "DE Bloom".
+std::string Humanize(const std::string& name);
+// Mod title: its ini file name without ".ini", underscores as spaces ("GTA_Prop_Fix.ini" -> "GTA Prop Fix"),
+// else the mod name.
+std::string ModTitle(const std::string& modName, const std::string& iniFile);
+// Slider range from a "range: A..B" comment line in a key's comment block. False if absent or not A < B.
+bool ParseRange(const std::string& description, double& lo, double& hi);
+// A slider value as ini text: Int rounded, Float with 2 decimals, trailing zeros trimmed to one ("1.50" -> "1.5").
+std::string FormatNumber(double v, ValueKind kind);
+
 }  // namespace modmenu

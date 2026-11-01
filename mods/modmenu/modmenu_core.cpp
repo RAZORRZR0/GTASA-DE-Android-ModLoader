@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <set>
 
 namespace modmenu {
@@ -350,6 +353,62 @@ std::string StepNumber(const std::string& value, ValueKind kind, int dir) {
     char buf[64];
     snprintf(buf, sizeof buf, "%.*f", decimals, n);
     return buf;
+}
+
+std::string Humanize(const std::string& name) {
+    std::string out;
+    const size_t n = name.size();
+    for (size_t i = 0; i < n; ++i) {
+        const char c = name[i];
+        if (c == '_') { if (!out.empty() && out.back() != ' ') out += ' '; continue; }
+        if (i > 0 && isupper((unsigned char)c) && !out.empty() && out.back() != ' ') {
+            const char p = name[i - 1];
+            const bool nextLower = i + 1 < n && islower((unsigned char)name[i + 1]);
+            if (islower((unsigned char)p) || isdigit((unsigned char)p) || (isupper((unsigned char)p) && nextLower)) out += ' ';
+        }
+        out += c;
+    }
+    return out;
+}
+
+std::string ModTitle(const std::string& modName, const std::string& iniFile) {
+    if (iniFile.empty()) return modName;
+    std::string t = iniFile;
+    if (t.size() > 4 && t.compare(t.size() - 4, 4, ".ini") == 0) t.resize(t.size() - 4);
+    std::replace(t.begin(), t.end(), '_', ' ');
+    return t;
+}
+
+bool ParseRange(const std::string& description, double& lo, double& hi) {
+    std::string d = description;
+    std::transform(d.begin(), d.end(), d.begin(), [](unsigned char c) { return (char)tolower(c); });
+    const size_t at = d.find("range:");
+    if (at == std::string::npos) return false;
+    const size_t dots = description.find("..", at + 6);
+    if (dots == std::string::npos) return false;
+    const std::string first = description.substr(at + 6, dots - (at + 6));  // strtod alone would eat "0." of "0..1"
+    char* end = nullptr;
+    const double a = strtod(first.c_str(), &end);
+    if (end == first.c_str() || strspn(end, " \t") != strlen(end)) return false;
+    const char* s = description.c_str() + dots + 2;
+    const double b = strtod(s, &end);
+    if (end == s || !(a < b)) return false;
+    lo = a;
+    hi = b;
+    return true;
+}
+
+std::string FormatNumber(double v, ValueKind kind) {
+    char buf[48];
+    if (kind == ValueKind::Int) {
+        snprintf(buf, sizeof buf, "%lld", (long long)llround(v));
+        return buf;
+    }
+    snprintf(buf, sizeof buf, "%.2f", v);
+    std::string s = buf;
+    while (s.size() > 1 && s.back() == '0' && s[s.size() - 2] != '.') s.pop_back();
+    if (s == "-0.0") s = "0.0";
+    return s;
 }
 
 }  // namespace modmenu
