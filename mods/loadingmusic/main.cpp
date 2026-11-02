@@ -23,7 +23,7 @@ extern "C" {
 }
 
 // ----------------------------------------------------------------------------
-// Configuration (SALoadingMusic.ini)
+// Configuration (LoadingMusic.ini)
 // ----------------------------------------------------------------------------
 static float g_volume = 1.25f;
 static float g_fadeOutSeconds = 0.75f;
@@ -70,7 +70,7 @@ static inline bool IniLookup(const char* path, const char* section, const char* 
 static void LoadConfig() {
     char path[PATH_MAX];
     const char* cfgDir = aml->GetConfigPath();
-    snprintf(path, sizeof(path), "%s%sSALoadingMusic.ini", cfgDir, (cfgDir[0] && cfgDir[strlen(cfgDir) - 1] == '/') ? "" : "/");
+    snprintf(path, sizeof(path), "%s%sLoadingMusic.ini", cfgDir, (cfgDir[0] && cfgDir[strlen(cfgDir) - 1] == '/') ? "" : "/");
 
     char val[64];
     if (IniLookup(path, "SALoadingMusic", "Volume", val, sizeof(val))) {

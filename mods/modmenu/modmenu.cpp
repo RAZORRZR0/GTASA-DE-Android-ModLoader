@@ -343,6 +343,14 @@ static std::string IniFor(size_t m) {
 
 static std::string ModTitle(size_t m) { return modmenu::ModTitle(g_mods.At(m).name, IniFor(m)); }
 
+// Mods that get a sub-tab: those with a settings ini (a tab without settings only wastes one of kModTabs slots).
+static std::vector<size_t> TabMods() {
+    std::vector<size_t> out;
+    for (size_t m = 0; m < g_mods.Count() && out.size() < (size_t)kModTabs; ++m)
+        if (!IniFor(m).empty()) out.push_back(m);
+    return out;
+}
+
 // Live settings: a loaded mod may export `extern "C" void GTAML_OnConfigChanged()`; we call it after saving its ini.
 typedef void (*ConfigChanged_Fn)();
 static ConfigChanged_Fn LiveHook(size_t mod) {
@@ -546,7 +554,7 @@ static void Build() {
     LOG("view %d: %zu rows", g_view, g_rows.size());
 }
 
-// Sub-tab headers: "mods", then the first kModTabs mods by title; unused buttons hidden. Children of
+// Sub-tab headers: "mods", then the first kModTabs mods with settings, by title; unused buttons hidden. Children of
 // UI_TabbedLayout_C.TabButtons are UI_Button_Base_C labelled via SetButtonTextValue(Text, JustRebuild=false).
 static void FixTabs() {
     void* box = PtrProp(g_tab, "TabButtons");
@@ -555,13 +563,14 @@ static void FixTabs() {
     TArrayRaw slots = {};
     if (!sp || !Rd(sp + UE::Prop_Offset, off) || !Rd((uint8_t*)box + off, slots) || slots.num < 1) return;
     g_mods.Scan(g_modsDir);
+    const std::vector<size_t> tabMods = TabMods();
     for (int i = 0; i < slots.num && i < 16; ++i) {
         void* slot = nullptr;
         void* btn = Rd(slots.data + i * 8, slot) ? PtrProp(slot, "Content") : nullptr;
         if (!btn) return;
-        const bool used = i == 0 || (i <= kModTabs && (size_t)(i - 1) < g_mods.Count());
+        const bool used = i == 0 || (size_t)(i - 1) < tabMods.size();
         if (used) {
-            struct { FTextRaw text; bool justRebuild; } args = {ToText(i == 0 ? "mods" : ModTitle((size_t)(i - 1))), false};
+            struct { FTextRaw text; bool justRebuild; } args = {ToText(i == 0 ? "mods" : ModTitle(tabMods[i - 1])), false};
             CallFn(btn, "SetButtonTextValue", &args, sizeof args);
         }
         SetVisible(btn, used);
@@ -581,7 +590,8 @@ static void OnTabUsed(int32_t tab) {
     }
     if (tab == g_tabSel || tab < 0 || tab > kModTabs) return;
     g_tabSel = tab;
-    g_view = tab == 0 || (size_t)(tab - 1) >= g_mods.Count() ? -1 : tab - 1;
+    const std::vector<size_t> tabMods = TabMods();
+    g_view = tab == 0 || (size_t)(tab - 1) >= tabMods.size() ? -1 : (int)tabMods[tab - 1];
     g_needBuild = true;
 }
 
@@ -589,16 +599,10 @@ static void Activate(Row& r, int dir) {  // dir: +1 next / -1 previous / 0 body 
     if (r.kind == RowKind::Slider) return;  // sliders change by dragging or typing (OnSliderEvent)
     switch (r.act) {
     case Act::OpenMod:
-        if (dir == 0) {
-            g_view = (int)r.mod;
-            g_needBuild = true;
-            if (r.mod < (size_t)kModTabs) {  // move the highlight to the mod's tab; TabUsed lands in OnTabUsed
-                const int32_t tab = (int32_t)r.mod + 1;
-                CallFn(g_tab, "SetToTab", &tab, sizeof tab);
-            }
-            return;
-        }
-        /* fallthrough: arrows toggle the mod from the list */
+        // Tapping a listed mod used to jump to its tab, which could land on the game's Options page; settings
+        // are reached through the sub-tabs, so a tap does nothing and the arrows toggle the mod.
+        if (dir == 0) return;
+        [[fallthrough]];
     case Act::ToggleMod:
         if (!g_mods.SetEnabled(r.mod, !g_mods.At(r.mod).enabled)) LOG("could not toggle %s", g_mods.At(r.mod).name.c_str());
         r.value = ModState(r.mod);
