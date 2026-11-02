@@ -9,7 +9,20 @@ This repo contains:
   it into the APK (`patch_apk_aml.sh`).
 - `mods/`: mods built against AML. `hello` is a test mod. `propfix` is a port
   of GTA_Prop_Fix (PC) to Android. `projectpropsde` is a port of ProjectPropsDE
-  (Project Props 4 map props, see `mods/projectpropsde/README.md`).
+  (Project Props 4 map props, see `mods/projectpropsde/README.md`). `cleo` is a
+  port of CLEO Android 2.0.1 (BSD-3): swipe-down CLEO menu, `.fxt` script text,
+  touch opcodes and its 14 SA scripts (`mods/cleo/scripts`) in
+  `Android/data/<pkg>/cleo/`. Every script is a menu entry: `.csi` start on
+  selection, `.csa` toggle on/off (kept in `cleo/enabled.txt`, "on" ones start
+  with each game). Scripts adapted to DE 1.87.0, all taken from `libUE4.so`:
+  cheats and jetpack to its arm64 code; cheat names to `CCheat::CheatLabel`
+  order (106 cheats); ONMISSION `$408`→`$410` (`CTheScripts::OnAMissionFlag`
+  = 1640) in mission selector and fightmaster; widget IDs to DE's
+  `CTouchInterface::m_pWidgets` slots (carboost 38→41, passenger 48→55,
+  flying 23→26, 30→33). `pakloader` mounts the user's own `.pak` files from
+  `Android/data/<pkg>/paks/` above the game's paks (e.g. GTA Radio Restore's
+  six PC station paks, which load as-is). `loadingmusic` ports SALoadingMusic
+  (PC): one of the eight `S_00N` loading themes plays while a save loads.
 - `sdk/`: `gtade.h` (SEH-free safe-read helpers) and `test_host.cpp`.
 - `docs/`: research notes, settings table, build notes.
 
